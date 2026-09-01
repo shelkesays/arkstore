@@ -1,39 +1,33 @@
 name: CI
 
+# Rust CI for Arkstore, modelled on safelint's ci.yml but for the Rust
+# toolchain. Actions use version tags for readability; dependabot (see
+# .github/dependabot.yml) keeps them fresh and can migrate them to SHA pins.
 on:
   push:
     branches: [master]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
-    name: build & test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build (all features)
-        run: cargo build --all-features --verbose
-      - name: Test (all features)
-        run: cargo test --all-features --verbose
-      - name: Build (no default features)
-        run: cargo build --no-default-features --verbose
-
-  # Runs the exact same checks as the local pre-commit pass: hygiene hooks,
-  # SafeLint (Rust rule set), rustfmt, and clippy (-D warnings).
+  # Lint tier: the exact local pre-commit pass (hygiene + SafeLint + rustfmt +
+  # clippy + cargo-machete + typos), plus a bare-feature clippy the hook omits.
   pre-commit:
-    name: pre-commit (safelint + rustfmt + clippy)
+    name: pre-commit (safelint + rustfmt + clippy + machete + typos)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -42,7 +36,84 @@ jobs:
         with:
           python-version: "3.12"
       - uses: pre-commit/action@v3.0.1
-      # pre-commit runs clippy with --all-features; also check the bare feature
-      # set, where the engine `cfg` arms compile differently.
       - name: clippy (no default features)
         run: cargo clippy --no-default-features -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }} / ${{ matrix.rust }})
+    runs-on: ${{ matrix.os }}
+    needs: pre-commit
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        rust: [stable]
+        include:
+          - os: ubuntu-latest
+            rust: beta
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (all features)
+        run: cargo build --all-features --verbose
+      - name: Test (all features)
+        run: cargo test --all-features --verbose
+      - name: Build (no default features)
+        run: cargo build --no-default-features --verbose
+
+  msrv:
+    name: MSRV (Rust 1.85)
+    runs-on: ubuntu-latest
+    needs: pre-commit
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85.0"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-features --verbose
+
+  features:
+    name: feature matrix (cargo-hack)
+    runs-on: ubuntu-latest
+    needs: pre-commit
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+      - name: check each feature
+        run: cargo hack --each-feature --no-dev-deps check
+
+  deny:
+    name: cargo-deny (advisories, licenses, bans, sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  toml:
+    name: taplo (TOML fmt + lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: taplo-cli
+      - run: taplo fmt --check
+      - run: taplo lint

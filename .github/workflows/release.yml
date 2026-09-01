@@ -1,45 +1,141 @@
 name: Release
 
-# Publishes prebuilt binaries for every supported OS/arch when a version tag is
-# pushed (e.g. `git tag v0.1.0 && git push --tags`). Does not run on normal pushes.
+# Branch-triggered, version-gated release — modelled on safelint's publish.yml,
+# adapted for Rust. The release signal is the version in Cargo.toml (a deliberate,
+# committed edit): when a push to master lands a commit that CHANGES the version
+# to one not yet tagged, this workflow tags it, builds cross-platform binaries,
+# creates the GitHub release, and (optionally) publishes to crates.io.
+#
+# Adding this workflow (version unchanged) does NOT release — the gate fires only
+# on the commit that bumps the version, so a skeleton 0.1.0 is never auto-shipped.
+#
+# A hyphen suffix (e.g. 0.2.0-rc.1) marks a pre-release.
+#
+# crates.io publishing is DORMANT until you opt in:
+#   1. set repo variable  PUBLISH_CRATES = true
+#   2. add repo secret     CARGO_REGISTRY_TOKEN  (a crates.io API token)
 on:
   push:
-    tags: ["v*"]
+    branches: [master]
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  # Serialise releases; never cancel one in progress.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  release:
+  gate:
+    name: Decide whether to release
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.decide.outputs.release }}
+      version: ${{ steps.decide.outputs.version }}
+      prerelease: ${{ steps.decide.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need history (HEAD~1) and tags
+          persist-credentials: false
+      - id: decide
+        run: |
+          set -euo pipefail
+          read_version() { grep -m1 '^version' "$1" | sed -E 's/.*"([^"]+)".*/\1/'; }
+          VERSION=$(read_version Cargo.toml)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          # semver pre-release = a hyphen suffix (0.2.0-rc.1).
+          if printf '%s' "$VERSION" | grep -qE '-'; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          PREV=$(git show HEAD~1:Cargo.toml 2>/dev/null | grep -m1 '^version' | sed -E 's/.*"([^"]+)".*/\1/' || true)
+          if [ "$VERSION" = "$PREV" ]; then
+            echo "::notice::version unchanged ($VERSION) - skipping"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          elif git rev-parse "v$VERSION" >/dev/null 2>&1; then
+            echo "::notice::tag v$VERSION already exists - skipping"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::releasing v$VERSION"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  create-release:
+    name: Tag and create GitHub release
+    needs: gate
+    if: needs.gate.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push the tag and create the release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.gate.outputs.version }}
+          PRERELEASE: ${{ needs.gate.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          git tag "v$VERSION"
+          git push origin "v$VERSION"
+          FLAGS=(--title "v$VERSION" --generate-notes)
+          if [ "$PRERELEASE" = "true" ]; then FLAGS+=(--prerelease); fi
+          gh release create "v$VERSION" "${FLAGS[@]}"
+
+  binaries:
     name: ${{ matrix.target }}
+    needs: [gate, create-release]
+    if: needs.gate.outputs.release == 'true'
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write # upload release assets
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-          - target: aarch64-apple-darwin
-            os: macos-latest
-          - target: x86_64-apple-darwin
-            os: macos-latest
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-latest }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/v${{ needs.gate.outputs.version }}
       - name: Build and upload
         uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: arkstore
           target: ${{ matrix.target }}
-          # Release binaries ship every engine.
           features: full
           no_default_features: true
           archive: arkstore-$tag-$target
           include: LICENSE,README.md
           checksum: sha256
+          ref: refs/tags/v${{ needs.gate.outputs.version }}
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  crates:
+    name: Publish to crates.io
+    needs: [gate, create-release]
+    if: needs.gate.outputs.release == 'true' && vars.PUBLISH_CRATES == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/v${{ needs.gate.outputs.version }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --all-features
