@@ -4,6 +4,9 @@ version: 2
 updates:
   - package-ecosystem: "cargo"
     directory: "/"
+    # Raise bumps against development (the RC branch) so they flow through the
+    # development -> master release path and never diverge master from development.
+    target-branch: "development"
     schedule:
       interval: "weekly"
     commit-message:
@@ -15,6 +18,7 @@ updates:
 
   - package-ecosystem: "github-actions"
     directory: "/"
+    target-branch: "development"
     schedule:
       interval: "weekly"
     commit-message:

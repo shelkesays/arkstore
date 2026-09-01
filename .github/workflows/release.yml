@@ -1,22 +1,24 @@
 name: Release
 
 # Branch-triggered, version-gated release — modelled on safelint's publish.yml,
-# adapted for Rust. The release signal is the version in Cargo.toml (a deliberate,
-# committed edit): when a push to master lands a commit that CHANGES the version
-# to one not yet tagged, this workflow tags it, builds cross-platform binaries,
+# adapted for Rust and this repo's gitflow (master = final, development = RC).
+# The release signal is the version in Cargo.toml (a deliberate, committed edit):
+# when a push lands a commit that CHANGES the version to one not yet tagged, on
+# its expected branch, this workflow tags it, builds cross-platform binaries,
 # creates the GitHub release, and (optionally) publishes to crates.io.
+#
+#   final version   (0.2.0)      -> releases from master   as a full release
+#   pre-release     (0.2.0-rc.1) -> releases from development as a pre-release
 #
 # Adding this workflow (version unchanged) does NOT release — the gate fires only
 # on the commit that bumps the version, so a skeleton 0.1.0 is never auto-shipped.
-#
-# A hyphen suffix (e.g. 0.2.0-rc.1) marks a pre-release.
 #
 # crates.io publishing is DORMANT until you opt in:
 #   1. set repo variable  PUBLISH_CRATES = true
 #   2. add repo secret     CARGO_REGISTRY_TOKEN  (a crates.io API token)
 on:
   push:
-    branches: [master]
+    branches: [master, development]
   workflow_dispatch:
 
 permissions:
@@ -47,22 +49,28 @@ jobs:
           VERSION=$(read_version Cargo.toml)
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-          # semver pre-release = a hyphen suffix (0.2.0-rc.1).
+          # semver pre-release (hyphen suffix, e.g. 0.2.0-rc.1) releases from
+          # development; a final version releases from master.
           if printf '%s' "$VERSION" | grep -qE '-'; then
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            EXPECTED_BRANCH=development
           else
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            EXPECTED_BRANCH=master
           fi
 
           PREV=$(git show HEAD~1:Cargo.toml 2>/dev/null | grep -m1 '^version' | sed -E 's/.*"([^"]+)".*/\1/' || true)
           if [ "$VERSION" = "$PREV" ]; then
             echo "::notice::version unchanged ($VERSION) - skipping"
             echo "release=false" >> "$GITHUB_OUTPUT"
+          elif [ "$GITHUB_REF_NAME" != "$EXPECTED_BRANCH" ]; then
+            echo "::notice::$VERSION is not releasable from $GITHUB_REF_NAME (expected $EXPECTED_BRANCH) - skipping"
+            echo "release=false" >> "$GITHUB_OUTPUT"
           elif git rev-parse "v$VERSION" >/dev/null 2>&1; then
             echo "::notice::tag v$VERSION already exists - skipping"
             echo "release=false" >> "$GITHUB_OUTPUT"
           else
-            echo "::notice::releasing v$VERSION"
+            echo "::notice::releasing v$VERSION from $GITHUB_REF_NAME"
             echo "release=true" >> "$GITHUB_OUTPUT"
           fi
 

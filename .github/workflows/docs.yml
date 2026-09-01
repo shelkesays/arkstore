@@ -1,0 +1,56 @@
+name: Docs
+
+# Builds the mdBook guide and deploys it to GitHub Pages. Modelled on safelint's
+# docs.yml (mkdocs -> gh-pages), using mdBook + the native Pages deployment.
+#
+# One-time setup: repo Settings -> Pages -> Build and deployment -> Source:
+# "GitHub Actions". Then the site is served at https://shelkesays.github.io/Arkstore/.
+on:
+  push:
+    branches: [master]
+    paths:
+      - "guide/**"
+      - "book.toml"
+      - "PRD.md"
+      - "docs/**"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+# Least privilege for the build; the deploy job elevates to what Pages needs.
+permissions:
+  contents: read
+
+# One Pages deployment at a time; do not cancel an in-flight deploy.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install mdBook
+        uses: taiki-e/install-action@v2
+        with:
+          tool: mdbook
+      - name: Build
+        run: mdbook build
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/book
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write # deploy to Pages
+      id-token: write # OIDC for the Pages deployment
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
