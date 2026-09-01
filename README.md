@@ -1,59 +1,89 @@
-# MySQL / MariaDB Backup Script #
+# Arkstore
 
-### Backup script helps in taking backup of mysql / mariadb database. ###
+**Backup, restore, retention-cleanup, and cold-tier archival for databases and
+files — to S3-compatible object storage. One safe-Rust binary.**
 
-* Quick summary
+> ⚠️ **Early / work in progress.** The architecture, config model, and CLI are
+> in place; the operation internals are being implemented (see the roadmap). Not
+> yet ready for production use.
 
-It takes backup of all the databases present on the host server.
+Arkstore is a single command-line binary that manages the full lifecycle of your
+database and file backups:
 
-If <pre><code>RDB_LIST_LOAD_FROM_DB = True</code></pre> will first create a list of databases present on server and write to the file locally
+- **`backup`** — dump databases / snapshot file trees to compressed archives in object storage.
+- **`restore`** — reconstruct a database or file tree from a chosen backup.
+- **`cleanup`** — apply calendar-tier retention (daily / weekly / monthly / yearly) to stored backups.
+- **`archive`** — move aged rows out of a live database into Parquet, keeping only a recent window in the source.
 
-If you wish to provide your own list of databases to take backup instead of all the databases present on server, give <pre><code>RDB_LIST_SOURCE_FILE  = /path/to/list/file</code></pre>
-NOTE: make sure in this case the <pre><code>RDB_LIST_LOAD_FROM_DB = False</code></pre>
+It is **config-driven**, **safe by default** (dry-run everywhere, delete only
+after an upload is verified, never deletes a key it can't parse), and **portable**
+(one statically linked binary, engines compiled in as opt-in features).
 
-If you wish to take backup on only one database, then give default db to <pre><code>RDB_DEFAULT_DB = "default_db"</code></pre>.
-NOTE: make sure in this case the <pre><code>RDB_LIST_LOAD_FROM_DB = False</code></pre>
+## Why
 
-<pre><code>RDB_DESTINATION_DIRECTORY = /path/to/backup/destination/directory</code></pre>
+Teams keep re-implementing the same fragile backup plumbing: dump to S3, a naming
+convention, a retention script that eventually deletes the wrong thing, and an
+ad-hoc job to move old log rows somewhere cheap. Arkstore consolidates those four
+operations behind one declarative config and one binary, with a correctness bias:
+every destructive path is preview-first and verify-before-delete.
 
-To compress all the backup files,
-<pre><code>ZIP_STATUS = True</code></pre>
+Written in Rust (`#![forbid(unsafe_code)]`) for a single dependency-free static
+binary, true parallelism, streaming I/O, and a strongly typed config.
 
+## Supported sources & engines
 
-NOTE: To keep list of all the databases that needs to be ignored while taking backup
-<pre><code>RDB_IGNORE = ["mysql", "information_schema", "performance_schema"]</code></pre>
+| Source | backup | restore | archive | Cargo feature |
+|---|:---:|:---:|:---:|---|
+| PostgreSQL | ✅ | ✅ | ✅ | `postgres` |
+| MySQL / MariaDB | ✅ | ✅ | ✅ | `mysql` |
+| MongoDB | ✅ | ✅ | ✅ | `mongo` |
+| Files / directories | ✅ | ✅ | — | `files` |
 
+Engines are **opt-in at compile time**. Using an engine that wasn't built into
+the binary fails fast with a clear rebuild message. The default build is
+`postgres,archive,files`; `--features full` (or `--all-features`) builds everything.
 
-* Version
-V0.1
+## Build
 
-### How do I get set up? ###
+```bash
+cargo build --release                       # default: postgres + archive + files
+cargo build --release --features full       # every engine
+cargo build --release --no-default-features --features "mysql,archive"
+```
 
-* Summary of set up
+The binary lands at `target/release/arkstore`.
 
-Need python
+## Usage
 
-* Configuration
+```bash
+arkstore backup   [--source <name>] [--dry-run]
+arkstore restore  [--source <name>] [--dry-run]
+arkstore cleanup  [generate-plan | execute-plan | run | consolidate-plans] [--source <name>] [--dry-run]
+arkstore archive  [--source <name>] [--dry-run]
 
-Update the details in config.py file
+# global: --config <path>  --log-level <level>
+```
 
-* Dependencies
+Configuration lives in a YAML file (`arkstore.yaml` by default); see
+[`arkstore.example.yaml`](arkstore.example.yaml). Credentials come from a secrets
+manager or a local secrets file, never the tracked config.
 
-No dependancies. It completely runs on os.system
+## Documentation
 
-* Database configuration
+- [`PRD.md`](PRD.md) — product requirements and design.
+- [`docs/knowledge-base.md`](docs/knowledge-base.md) — the detailed behavioral
+  spec (retention algorithm, archive whole-months policy, plan schema, S3 layout
+  and lifecycle guidance) that drives the implementation.
 
-Make sure the database user provided in config.py file has access to all the databases or atleast to the databases whose backup needs to be taken.
+## Roadmap
 
-* How to run tests
+- **M0** — CLI, config/secrets, object-store abstraction, Postgres backup + restore. *(in progress)*
+- **M1** — full cleanup: retention model, plan/execute/consolidate, audit trail.
+- **M2** — archive: Postgres engine, Parquet writer, whole-months policy.
+- **M3** — MySQL + Mongo backup/restore/archive; file sources.
+- **M4** — prebuilt releases, container image, docs, a `verify` (round-trip) op.
+- **M5** — client-side encryption; additional object stores (GCS/Azure).
 
-python database.py 
+## License
 
-* Deployment instructions
-
-python database.py 
-
-
-### Who do I talk to? ###
-
-* @srahul07
+[MIT](LICENSE) © Rahul Shelke

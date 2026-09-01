@@ -1,0 +1,53 @@
+# Arkstore example configuration.
+# Copy to `arkstore.yaml` and edit. Credentials belong in a secrets manager or a
+# local secrets file (e.g. arkstore_secrets.yaml) — never commit real ones.
+
+app:
+  timezone: Asia/Kolkata      # IANA name; all calendar decisions use this
+  log_level: info             # error | warn | info | debug | trace
+
+aws:
+  bucket: my-backups-bucket
+  region: ap-south-1
+  folder: dbbackup            # backups live under this prefix; cleanup scans only here
+  # endpoint: http://localhost:9000   # uncomment for MinIO / S3-compatible
+
+cleanup:
+  enable: true
+  retention:                  # keep the newest backup per period in each band
+    daily: true
+    weekly: true
+    monthly: true
+    yearly: true
+  plans_prefix: retention-plans/
+  delete_batch_size: 1000
+  consolidate_plans: true
+
+archive:
+  enable: true
+  format: parquet
+  s3_prefix: archive          # dedicated top-level prefix, OUTSIDE aws.folder
+  default_retention_days: 90  # ~3 months; used when a rule omits retention_days
+  whole_months: true          # archive complete calendar months only
+  delete_after_archive: true  # move semantics: delete rows after verified upload
+  dry_run: false
+  compression: snappy
+  fetch_batch_size: 50000
+
+sources:
+  - name: appdb
+    type: postgre             # postgre | mysql | mongo | file
+    enable: true
+    host: db.internal
+    port: 5432
+    user: backup
+    # password: <from secrets>
+    archive:
+      - table: logs
+        time_column: dttm
+        retention_days: 90
+
+  - name: config-files
+    type: file
+    enable: true
+    path: /etc/myapp

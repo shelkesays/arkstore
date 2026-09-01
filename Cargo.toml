@@ -1,0 +1,39 @@
+[package]
+name = "arkstore"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "Backup, restore, retention-cleanup, and cold-tier archival for databases and files to object storage."
+repository = "https://github.com/shelkesays/Arkstore"
+authors = ["Rahul Shelke"]
+readme = "README.md"
+keywords = ["backup", "restore", "archive", "s3", "database"]
+categories = ["command-line-utilities", "database"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+
+[features]
+# A sensible default build: Postgres + file sources + Parquet archival.
+default = ["postgres", "archive", "files"]
+postgres = []
+mysql = []
+mongo = []
+archive = []
+files = []
+# Everything compiled in — the primary release build.
+full = ["postgres", "mysql", "mongo", "archive", "files"]
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"
