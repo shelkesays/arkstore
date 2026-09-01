@@ -68,6 +68,18 @@ Configuration lives in a YAML file (`arkstore.yaml` by default); see
 [`arkstore.example.yaml`](arkstore.example.yaml). Credentials come from a secrets
 manager or a local secrets file, never the tracked config.
 
+Sources are processed **in parallel**, bounded by the `concurrency` block:
+`max_sources` (how many at once — a ceiling that protects the DB/object store) and
+`cpu_workers` (parallel compression / Parquet encoding — `auto` = cores). See
+[PRD §9.5](PRD.md) and [knowledge base §9](docs/knowledge-base.md).
+
+## Platforms
+
+Runs on **Linux, macOS, and Windows** from one codebase — no OS-specific code path.
+CI builds and tests on all three; tagged releases publish prebuilt binaries for
+Linux (`x86_64` gnu/musl, `aarch64`), macOS (`aarch64`, `x86_64`), and Windows
+(`x86_64`).
+
 ## Documentation
 
 - [`PRD.md`](PRD.md) — product requirements and design.

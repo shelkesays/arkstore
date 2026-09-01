@@ -1,8 +1,10 @@
 //! The declarative Arkstore configuration: global policy plus sources.
 
+mod concurrency;
 mod policy;
 mod source;
 
+pub use concurrency::{Concurrency, Limit, Resolved as ResolvedConcurrency};
 pub use policy::{ArchivePolicy, CleanupPolicy, RetentionTiers};
 pub use source::{ArchiveRule, Source, SourceType};
 
@@ -67,6 +69,8 @@ pub struct Config {
     pub cleanup: CleanupPolicy,
     #[serde(default)]
     pub archive: ArchivePolicy,
+    #[serde(default)]
+    pub concurrency: Concurrency,
     #[serde(default)]
     pub sources: Vec<Source>,
 }
