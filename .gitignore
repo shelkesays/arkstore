@@ -1,5 +1,11 @@
-venv/
-backup/
-*.out
-*.pyc
-*.txt
+# Rust build output
+/target
+**/*.rs.bk
+
+# macOS
+.DS_Store
+
+# Local config & secrets — never commit real ones (examples are committed)
+/arkstore.yaml
+/sources.yaml
+/*secrets*.yaml
