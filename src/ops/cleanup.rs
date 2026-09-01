@@ -33,7 +33,7 @@ pub fn run(
     }
     // TODO(M1): scan bucket -> band into tiers -> plan (validated) -> execute
     // -> consolidate. Never delete the latest pointer, today's backups, or an
-    // unparseable key.
+    // unparsable key.
     info!(?action, source = ?only, dry_run, "cleanup not yet implemented");
     Ok(vec![])
 }

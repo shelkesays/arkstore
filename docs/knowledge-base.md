@@ -70,7 +70,7 @@ of key are **untouchable**:
 
 - the `latest` pointer,
 - today's backups (live),
-- **any key whose layout or timestamp cannot be parsed** — unparseable ⇒ **keep**.
+- **any key whose layout or timestamp cannot be parsed** — unparsable ⇒ **keep**.
 
 ### 3.2 Band
 
@@ -250,7 +250,7 @@ backup and archive rules **together in one call**, or existing rules are wiped.
   Standard/IA (instant restore) while the source is still backed up.
 - Cleanup **never** touches archives: archives live under a different prefix, and
   even if scanned, a `.parquet` key doesn't match the backup key format, so it'd
-  be classified unparseable and kept.
+  be classified unparsable and kept.
 
 ---
 

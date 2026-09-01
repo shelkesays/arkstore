@@ -18,8 +18,7 @@ serde_yaml = "0.9"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-chrono = { version = "0.4", features = ["serde"] }
-chrono-tz = "0.10"
+# chrono / chrono-tz return when timezone-aware retention/archive logic lands (M1/M2).
 
 [features]
 # A sensible default build: Postgres + file sources + Parquet archival.
