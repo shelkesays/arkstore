@@ -234,7 +234,7 @@ Two layers, both declarative:
    (bucket, region, folder, endpoint for S3-compatible), and per-operation blocks — `cleanup`
    (retention tiers, plans prefix, batch size, consolidate flag), `archive` (format, prefix,
    default retention days, whole_months, delete_after_archive, dry_run, compression, fetch batch
-   size).
+   size), and `concurrency` (`max_sources`, `cpu_workers` — see §9.5).
 2. **Sources** (`sources.yaml`): a list of source entries — `name`, `type`, `enable`, connection
    details, optional `archive` rules (block-YAML style), and restore target overrides.
 
@@ -288,6 +288,44 @@ Requirements:
   Arkstore — but documented (recommended lifecycle schedules for backup vs. archive prefixes,
   and the "one lifecycle document, many prefix-scoped rules" gotcha).
 
+### 9.5 Concurrency & parallelism
+
+Where the-predecessor processed sources one at a time, Arkstore runs them in parallel — but the model
+is chosen around the workload's shape, not raw core count.
+
+**The workload is mostly I/O-bound with bursts of CPU.** Per source: dump/fetch (DB network
+I/O) → compress / Parquet-encode (**CPU**) → upload (object-store network I/O) → optional delete
+(DB I/O). Cleanup is almost entirely list/delete network I/O.
+
+Two independent limits, resolved from the `concurrency` config block:
+
+- **`max_sources`** — how many sources are processed concurrently, as bounded async tasks (a
+  semaphore over a shared runtime), **not** a thread or process per source. Because the per-source
+  work is mostly network wait, this is **not tied to core count**; its purpose is to protect the
+  **database and object store** from overload. `auto` = a conservative default (4); raise it when
+  the target can take the load.
+- **`cpu_workers`** — parallel workers for the CPU-bound stages (compression, Parquet encoding),
+  run on a blocking/rayon pool. `auto` = number of available cores (`std::thread::available_
+  parallelism`); a fixed value is **clamped to the core count**, since oversubscription only adds
+  contention.
+
+Design choices and rationale:
+
+- **Async tasks, not processes.** Threads/async avoid per-process cost and secret/config sharing
+  complexity; crash isolation for the risky part already comes free because dump tools run as
+  child processes at that boundary.
+- **The real limiter is the DB and object store**, not local hardware: many heavy dumps against
+  one shared instance hurt production, and many parallel uploads invite object-store throttling
+  (needs retry/backoff). A later refinement is a **per-host cap** so sources sharing a database
+  instance serialize while sources on different hosts run in parallel.
+- **A ceiling, not a floor.** For a batch job only a maximum is meaningful; there is no
+  "minimum parallelism" knob.
+
+Invariants preserved under parallelism: per-source/per-target **failure isolation** (tasks are
+joined; failures aggregate into the exit code), **verify-before-delete** (each partition's delete
+waits on its own verified upload; parallel months are disjoint partitions), and readable output
+(every log line is tagged with its `source`).
+
 ---
 
 ## 10. CLI Design (proposed)
@@ -310,11 +348,27 @@ Global: --config, --log-level, --timezone, --version, --help
 
 ## 11. Packaging & Distribution
 
+**Cross-platform / OS-agnostic is a first-class requirement.** The same tool runs on Linux, macOS,
+and Windows; one static binary per platform, built from one codebase.
+
 - **Single static binary** per platform (musl for Linux to avoid glibc coupling); no runtime deps.
+- **Prebuilt release binaries** for every supported target, published on GitHub Releases with
+  checksums (see the release workflow):
+  - Linux `x86_64` (gnu + musl) and `aarch64`
+  - macOS `aarch64` (Apple Silicon) and `x86_64` (Intel)
+  - Windows `x86_64`
 - **Cargo features** = the engine opt-in model: `postgres`, `mysql`, `mongo`, `archive`, `files`.
   Default feature set is a sensible common case; `full` / `--all-features` builds everything.
-- GitHub Releases with prebuilt full-feature binaries (Linux x86_64/arm64, macOS, Windows) +
-  checksums; optional slim per-engine builds.
+  Release binaries ship `full`; optional slim per-engine builds are possible.
+- **OS-agnostic by construction:** the crate uses cross-platform std and portable crates
+  (`std::path::PathBuf`, `available_parallelism`, native `tar`/`flate2`/`zstd`/`arrow` rather than
+  shelling out to `tar`/`gzip`), so archival and file backup have no OS-specific code path.
+- **DB dump tooling is the one OS-dependent edge:** where an engine shells out to a client tool
+  (`pg_dump`, `mysqldump`), that tool must be on `PATH`; the archive path (native drivers) needs
+  nothing external. Per-OS install notes cover this, and the roadmap includes native-driver
+  backup to remove the dependency entirely.
+- **CI builds and tests on Linux, macOS, and Windows** on every change; the release workflow
+  cross-builds the full target matrix on tags.
 - Container image: distroless/minimal base + the static binary; no interpreter, tiny image.
 - `cargo install arkstore --features …` for source installs.
 

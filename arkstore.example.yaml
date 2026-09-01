@@ -23,6 +23,14 @@ cleanup:
   delete_batch_size: 1000
   consolidate_plans: true
 
+concurrency:
+  # Sources processed in parallel. `auto` is a conservative default (protects a
+  # shared DB); raise it when the target can take the load. NOT tied to cores.
+  max_sources: auto           # auto | <positive integer>
+  # Parallel CPU workers for compression / Parquet encoding. `auto` = num cores;
+  # a fixed value is clamped to the available core count.
+  cpu_workers: auto           # auto | <positive integer>
+
 archive:
   enable: true
   format: parquet

@@ -265,3 +265,72 @@ backup and archive rules **together in one call**, or existing rules are wiped.
 - **Dry-run** on every destructive operation: zero writes, zero deletes.
 - **Verify-before-delete** for both archive (upload verified before row delete)
   and backup.
+
+---
+
+## 9. Concurrency & parallelism
+
+Sources are processed in parallel (the-predecessor ran them serially). The model is
+built around the workload's shape, not raw core count.
+
+**Workload shape:** mostly I/O-bound with CPU bursts. Per source: dump/fetch (DB
+network I/O) → compress / Parquet-encode (**CPU**) → upload (object-store I/O) →
+optional delete (DB I/O). Cleanup is almost entirely list/delete network I/O.
+
+### 9.1 Two independent limits (`concurrency` config block)
+
+| Knob | Bounds | `auto` default | Fixed value |
+|---|---|---|---|
+| `max_sources` | sources processed at once (I/O) | **4** (conservative; protects a shared DB) | honored as-is (min 1); **not** clamped to cores |
+| `cpu_workers` | compress / Parquet encode (CPU) | number of available cores | **clamped to core count** (min 1) |
+
+- `max_sources` is deliberately *not* tied to core count — the per-source work is
+  mostly network wait, so a 2-core host can still run several sources at once. Its
+  job is to avoid overwhelming the database / object store.
+- `cpu_workers` resolves `auto` via `std::thread::available_parallelism()` and
+  clamps fixed values down to that, since oversubscribing cores only adds contention.
+- Accepted YAML values: the keyword `auto` or a positive integer; `0` or any other
+  string is a validation error naming the field.
+
+### 9.2 Implementation model
+
+- **Bounded async tasks (tokio) + a semaphore** for source parallelism — not a
+  thread or process per source. CPU-bound stages offload to a blocking/rayon pool
+  sized to `cpu_workers`.
+- **No multiprocessing.** Crash isolation for the risky part is already free: dump
+  tools (`pg_dump`, …) run as child processes at that boundary.
+- **The real limiter is the DB and object store**, not local hardware. Watch for:
+  DB load from concurrent heavy dumps against one instance; object-store throttling
+  (503 SlowDown) under many parallel uploads → retry with backoff; DB connection
+  limits. Future refinement: a **per-host cap** so sources sharing an instance
+  serialize while different hosts run in parallel.
+- **Only a maximum is meaningful** for a batch job — there is no "minimum
+  parallelism" setting.
+
+### 9.3 Invariants under parallelism
+
+- **Failure isolation** per source/target — tasks are joined; failures aggregate
+  into the exit code (one bad source never aborts the run).
+- **Verify-before-delete** holds — each partition's delete waits on its own verified
+  upload; parallel months are disjoint partitions, so the append-only safety
+  argument (§4.4) is unaffected.
+- **Readable logs** — parallel output interleaves, but every line is tagged with its
+  `source`.
+
+---
+
+## 10. Portability (OS-agnostic)
+
+The same binary target runs on Linux, macOS, and Windows; the crate has **no
+OS-specific code path**.
+
+- Uses cross-platform std and portable crates: `std::path::PathBuf`,
+  `available_parallelism`, and native `tar`/`flate2`/`zstd`/`arrow` rather than
+  shelling out to `tar`/`gzip`.
+- The **one OS-dependent edge** is DB dump tooling: engines that shell out to a
+  client (`pg_dump`, `mysqldump`) need it on `PATH`. The archive path uses native
+  drivers and needs nothing external; the roadmap adds native-driver backup to
+  remove the dependency entirely.
+- Prebuilt release binaries: Linux `x86_64` (gnu + musl) + `aarch64`, macOS
+  `aarch64` + `x86_64`, Windows `x86_64`. CI builds/tests on all three OSes; the
+  release workflow cross-builds the matrix on version tags.

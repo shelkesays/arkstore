@@ -3,7 +3,7 @@
 use std::process::ExitCode;
 
 use clap::Parser;
-use tracing::error;
+use tracing::{debug, error};
 use tracing_subscriber::EnvFilter;
 
 use arkstore::cli::{Cli, Command};
@@ -31,6 +31,14 @@ fn main() -> ExitCode {
 /// items (sources/targets) that failed, so `main` can pick the exit code.
 fn run(cli: &Cli) -> arkstore::Result<Vec<String>> {
     let config = Config::load(&cli.config)?;
+
+    let concurrency = config.concurrency.resolved();
+    debug!(
+        max_sources = concurrency.max_sources,
+        cpu_workers = concurrency.cpu_workers,
+        "resolved concurrency"
+    );
+
     match &cli.command {
         Command::Backup { source, dry_run } => ops::backup(&config, source.as_deref(), *dry_run),
         Command::Restore { source, dry_run } => ops::restore(&config, source.as_deref(), *dry_run),
