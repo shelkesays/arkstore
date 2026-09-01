@@ -26,7 +26,7 @@ jobs:
     name: Reset development to master (if safe)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # need full history for patch-id comparison
       - name: Reset development to master when safe
