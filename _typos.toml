@@ -1,0 +1,3 @@
+# typos spell-checker config. Allow legitimate identifiers the dictionary flags.
+[default.extend-identifiers]
+flate2 = "flate2" # Rust gzip/deflate crate name

@@ -169,7 +169,7 @@ from sources removed from config).
 **Invariants (safety):**
 - Grouping is **per source** — one source's backups never thin another's.
 - Never delete: the `latest` pointer, today's backups, or **any key whose layout/timestamp
-  can't be parsed** (unparseable ⇒ keep).
+  can't be parsed** (unparsable ⇒ keep).
 - A period group is never emptied — a period with a single backup keeps it.
 - Disabling a tier keeps its whole band (or falls back to the next-coarser tier), never a
   wholesale delete.
@@ -272,7 +272,7 @@ Requirements:
 ### 9.2 Safety & Correctness
 - `--dry-run` on **every** destructive operation, doing zero writes/deletes.
 - **Verify-before-delete** for both archive (upload verified before row delete) and backup.
-- **Never delete the unparseable** in cleanup.
+- **Never delete the unparsable** in cleanup.
 - Plan validation before any cleanup execution.
 - Per-source/per-target **failure isolation**; aggregate failures into the exit code.
 

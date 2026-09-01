@@ -1,0 +1,70 @@
+name: Claude PR Review
+
+# Opt-in, owner-controlled review: runs ONLY when the `claude-review` label is
+# added to a PR. No label, no run, no tokens. Re-review by removing and re-adding
+# the label. Dormant until repo secret ANTHROPIC_API_KEY is set (the API key
+# bills the metered Anthropic API, which is why invocation is manual).
+on:
+  pull_request:
+    types: [labeled]
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  claude-review:
+    if: github.event.label.name == 'claude-review' && !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write # post inline review comments
+      id-token: write # required by claude-code-action
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Claude Code review
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            You are reviewing a pull request for Arkstore, a safe-Rust CLI that
+            backs up, restores, retention-cleans, and cold-tier archives databases
+            and files to S3-compatible object storage. Start from `gh pr diff`.
+
+            Review ONLY for these classes of issue, in priority order:
+            1. Logic / correctness bugs in the changed code.
+            2. Safety & data-loss risks specific to this tool: a delete that can run
+               before its upload is verified, deleting an unparseable/unknown key,
+               a retention/archive boundary miscomputation, or a dry-run path that
+               still writes or deletes.
+            3. Rust engineering problems: panics/`unwrap`/`expect` on non-test paths,
+               unhandled `Result`, blocking calls on an async runtime, unbounded
+               memory (non-streaming) on large tables, integer truncation, and any
+               use of `unsafe` (the crate is `#![forbid(unsafe_code)]`).
+            4. Concurrency correctness: shared-state races, per-source failure
+               isolation broken, or exceeding the configured concurrency limits.
+            5. Feature-flag parity: a change touching an engine must stay consistent
+               across its `#[cfg(feature = "...")]` gates, the factory/guard, docs,
+               and the feature list in Cargo.toml. You may read those files beyond
+               the diff for parity; stay targeted.
+
+            Do NOT comment on formatting, style, naming, or anything rustfmt,
+            clippy, or SafeLint already enforce — deterministic CI covers that.
+
+            Report at most 5 findings, highest severity first; skip nitpicks.
+            Post each finding with
+            mcp__github_inline_comment__create_inline_comment
+            (confirmed: true) on the exact line. If you find nothing
+            significant, post nothing.
+          claude_args: |
+            --model claude-sonnet-5
+            --max-turns 25
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr diff:*),Bash(gh pr view:*)"

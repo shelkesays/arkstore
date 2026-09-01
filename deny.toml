@@ -1,0 +1,42 @@
+# cargo-deny — supply-chain policy for Arkstore.
+# Run: cargo deny check   (CI runs this on every push / PR)
+
+[graph]
+all-features = true
+
+[advisories]
+# RUSTSEC advisory database. In the v2 format, vulnerabilities and
+# unmaintained crates are denied by default; yanked crates are denied here.
+version = 2
+yanked = "deny"
+# ignore = ["RUSTSEC-0000-0000"]  # add IDs here (with a comment) only if justified
+
+[licenses]
+# MIT project: only permissive licenses compatible with MIT redistribution.
+# Anything not listed fails the check.
+version = 2
+confidence-threshold = 0.9
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Zlib",
+  "CC0-1.0",
+  "MPL-2.0",
+]
+
+[bans]
+# Warn on duplicate versions (dependency bloat); block wildcard version reqs.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
