@@ -80,6 +80,20 @@ CI builds and tests on all three; tagged releases publish prebuilt binaries for
 Linux (`x86_64` gnu/musl, `aarch64`), macOS (`aarch64`, `x86_64`), and Windows
 (`x86_64`).
 
+## Development
+
+Run the full check suite before every commit (the git hook is intentionally not
+installed — run it manually; CI runs the same set):
+
+```bash
+pre-commit run --all-files
+```
+
+This runs hygiene hooks, **SafeLint** (Holzmann Power-of-Ten safety rules, Rust
+rule set), `rustfmt --check`, and `clippy -D warnings`. SafeLint's grammar is
+provided automatically inside the hook environment; to run it directly, install
+`pip install 'safelint[rust]'`.
+
 ## Documentation
 
 - [`PRD.md`](PRD.md) — product requirements and design.

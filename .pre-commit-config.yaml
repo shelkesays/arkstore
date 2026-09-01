@@ -1,0 +1,48 @@
+# Pre-commit configuration for Arkstore.
+#
+# The git hook is intentionally NOT installed. Run the checks manually before
+# every commit (and CI runs them too):
+#
+#     pre-commit run --all-files
+#
+# Layers:
+#   - hygiene       : whitespace / EOF / YAML+TOML validity / merge markers
+#   - safelint      : Holzmann Power-of-Ten safety rules (Rust rule set)
+#   - rustfmt+clippy: the Rust equivalent of ruff-format + ruff, at full strictness
+minimum_pre_commit_version: "3.5.0"
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+      - id: mixed-line-ending
+
+  # SafeLint — safety-critical static analysis (Rust rule set).
+  # https://github.com/shelkesays/safelint
+  - repo: https://github.com/shelkesays/safelint
+    rev: v2.11.0
+    hooks:
+      - id: safelint
+        additional_dependencies: ['safelint[rust]']
+
+  # Rust toolchain checks (system cargo). The ruff-equivalent strict layer.
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt (--check)
+        entry: cargo fmt --all --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+      - id: cargo-clippy
+        name: cargo clippy (-D warnings, all features)
+        entry: cargo clippy --all-targets --all-features -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false

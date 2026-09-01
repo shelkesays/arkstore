@@ -2,6 +2,10 @@
 /target
 **/*.rs.bk
 
+# Tool caches
+/.safelint_cache/
+/.ruff_cache/
+
 # macOS
 .DS_Store
 
@@ -9,3 +13,6 @@
 /arkstore.yaml
 /sources.yaml
 /*secrets*.yaml
+
+# AI-client local settings (the committed skill under .claude/skills/ stays tracked)
+.claude/settings.local.json
