@@ -27,8 +27,10 @@ jobs:
       - name: Build (no default features)
         run: cargo build --no-default-features --verbose
 
-  lint:
-    name: fmt & clippy
+  # Runs the exact same checks as the local pre-commit pass: hygiene hooks,
+  # SafeLint (Rust rule set), rustfmt, and clippy (-D warnings).
+  pre-commit:
+    name: pre-commit (safelint + rustfmt + clippy)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -36,9 +38,11 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: rustfmt
-        run: cargo fmt --all --check
-      - name: clippy (all features)
-        run: cargo clippy --all-features -- -D warnings
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: pre-commit/action@v3.0.1
+      # pre-commit runs clippy with --all-features; also check the bare feature
+      # set, where the engine `cfg` arms compile differently.
       - name: clippy (no default features)
         run: cargo clippy --no-default-features -- -D warnings
