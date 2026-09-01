@@ -1,0 +1,20 @@
+[book]
+title = "Arkstore"
+authors = ["Rahul Shelke"]
+description = "Backup, restore, retention-cleanup, and cold-tier archival to object storage."
+src = "guide"
+language = "en"
+
+[build]
+build-dir = "target/book"
+
+[output.html]
+site-url = "/Arkstore/"
+git-repository-url = "https://github.com/shelkesays/Arkstore"
+edit-url-template = "https://github.com/shelkesays/Arkstore/edit/master/guide/{path}"
+default-theme = "rust"
+preferred-dark-theme = "ayu"
+
+[output.html.fold]
+enable = true
+level = 1
