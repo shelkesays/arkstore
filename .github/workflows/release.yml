@@ -38,7 +38,7 @@ jobs:
       version: ${{ steps.decide.outputs.version }}
       prerelease: ${{ steps.decide.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # need history (HEAD~1) and tags
           persist-credentials: false
@@ -82,7 +82,7 @@ jobs:
     permissions:
       contents: write # push the tag and create the release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Tag and release
@@ -116,7 +116,7 @@ jobs:
           - { target: x86_64-apple-darwin, os: macos-latest }
           - { target: x86_64-pc-windows-msvc, os: windows-latest }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: refs/tags/v${{ needs.gate.outputs.version }}
       - name: Build and upload
@@ -138,7 +138,7 @@ jobs:
     if: needs.gate.outputs.release == 'true' && vars.PUBLISH_CRATES == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: refs/tags/v${{ needs.gate.outputs.version }}
           persist-credentials: false
