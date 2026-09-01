@@ -1,0 +1,68 @@
+name: Sync development with master
+
+# After every push to master, reset development to master so the two never
+# diverge (matches safelint's sync-development, master/development flavor). That
+# divergence is what forces squash-over-rebase headaches; keeping development
+# identical to master after each release removes the whole class.
+#
+# Reset-if-safe: development is reset ONLY when it has no commits whose CONTENT is
+# not already in master (patch-id via git cherry, so a squash-merged release reads
+# as safe). If genuinely unmerged work exists, the job refuses and fails loudly
+# rather than clobbering it. It also creates development from master if missing.
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write # force-push the development branch
+
+concurrency:
+  group: sync-development
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Reset development to master (if safe)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need full history for patch-id comparison
+      - name: Reset development to master when safe
+        run: |
+          set -euo pipefail
+          git fetch origin master --quiet
+
+          # Bootstrap: create development from master if it does not exist yet.
+          if ! git ls-remote --exit-code --heads origin development >/dev/null 2>&1; then
+            echo "development does not exist - creating it from master."
+            git push origin "origin/master:refs/heads/development"
+            exit 0
+          fi
+
+          git fetch origin development --quiet
+
+          # Count development commits whose PATCH is not already in master (git
+          # cherry is patch-id based, so a squash/rebase-merged release - content
+          # identical but different SHAs - correctly reads as 0). Merge commits
+          # cannot be patch-compared, so any merge in the range is treated as
+          # unsafe (the same conservative posture as the AHEAD guard).
+          CHERRY=$(git cherry origin/master origin/development)
+          AHEAD=$(printf '%s\n' "$CHERRY" | grep -c '^+' || true)
+          MERGES=$(git rev-list --merges origin/master..origin/development --count)
+          if [ "$AHEAD" -ne 0 ] || [ "$MERGES" -ne 0 ]; then
+            echo "::error::development diverges from master - refusing to reset ($AHEAD unmerged commit(s), $MERGES merge commit(s)). Land that work through the release flow, then re-run."
+            exit 1
+          fi
+
+          if [ "$(git rev-parse origin/development)" = "$(git rev-parse origin/master)" ]; then
+            echo "development already equals master - nothing to do."
+            exit 0
+          fi
+
+          # Safe: development is fully contained in master; only the SHAs differ.
+          # --force-with-lease guards against a race between the check and push.
+          git push --force-with-lease=development:"$(git rev-parse origin/development)" \
+            origin "origin/master:refs/heads/development"
+          echo "development reset to master ($(git rev-parse --short origin/master))."

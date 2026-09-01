@@ -5,8 +5,9 @@ name: CI
 # .github/dependabot.yml) keeps them fresh and can migrate them to SHA pins.
 on:
   push:
-    branches: [master]
+    branches: [master, development]
   pull_request:
+    branches: [master, development]
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}

@@ -90,16 +90,36 @@ pre-commit run --all-files
 ```
 
 This runs hygiene hooks, **SafeLint** (Holzmann Power-of-Ten safety rules, Rust
-rule set), `rustfmt --check`, and `clippy -D warnings`. SafeLint's grammar is
+rule set), `rustfmt --check`, `clippy -D warnings`, **cargo-machete** (unused
+deps), and **typos**. CI additionally runs **cargo-deny** (advisories/licenses),
+**cargo-hack** (feature matrix), and **taplo** (TOML). SafeLint's grammar is
 provided automatically inside the hook environment; to run it directly, install
 `pip install 'safelint[rust]'`.
 
+### Branching & releases
+
+This repo follows a two-branch gitflow:
+
+- **`master`** — stable; final releases (`X.Y.Z`) ship from here.
+- **`development`** — integration / RC branch; pre-releases (`X.Y.Z-rc.N`) ship
+  from here. Dependabot targets it, and it is auto-reset to `master` after each
+  master push (`sync-development.yml`).
+
+Releases are **version-gated**: bumping the version in `Cargo.toml` on the matching
+branch tags it, builds cross-platform binaries, and creates the GitHub release
+(see `.github/workflows/release.yml`).
+
 ## Documentation
+
+Rendered guide (mdBook): **<https://shelkesays.github.io/Arkstore/>**
 
 - [`PRD.md`](PRD.md) — product requirements and design.
 - [`docs/knowledge-base.md`](docs/knowledge-base.md) — the detailed behavioral
   spec (retention algorithm, archive whole-months policy, plan schema, S3 layout
   and lifecycle guidance) that drives the implementation.
+
+The site is built from `guide/` (which includes `PRD.md` and
+`docs/knowledge-base.md`) and deployed to GitHub Pages by `docs.yml`.
 
 ## Roadmap
 
