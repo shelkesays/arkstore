@@ -109,8 +109,8 @@ Representative use cases:
 `mongo`, `archive`, `files`). A default build may include a common set (e.g. `postgres,archive`);
 `--all-features` builds everything. Using an engine that wasn't compiled in fails fast with a
 clear message: *"PostgreSQL support was not built into this binary. Rebuild with
-`--features postgres` or download the full release."* — mirroring the-predecessor's optional-extras model
-(`the-predecessor[postgre,archive]`) but resolved at compile time into one artifact.
+`--features postgres` or download the full release."* — the same "opt in to the engines you use"
+idea as package extras, but resolved at compile time into one self-contained artifact.
 
 Prebuilt releases: publish a **full-feature** binary per platform, plus optionally slim
 per-engine builds. Because it's one static binary, "install the right extra" becomes "download
@@ -341,8 +341,8 @@ Requirements:
 
 ### 9.5 Concurrency & parallelism
 
-Where the-predecessor processed sources one at a time, Arkstore runs them in parallel — but the model
-is chosen around the workload's shape, not raw core count.
+Arkstore processes sources in parallel rather than one at a time — but the model is chosen
+around the workload's shape, not raw core count.
 
 **The workload is mostly I/O-bound with bursts of CPU.** Per source: dump/fetch (DB network
 I/O) → compress / Parquet-encode (**CPU**) → upload (object-store network I/O) → optional delete

@@ -270,7 +270,7 @@ backup and archive rules **together in one call**, or existing rules are wiped.
 
 ## 9. Concurrency & parallelism
 
-Sources are processed in parallel (the-predecessor ran them serially). The model is
+Sources are processed in parallel rather than serially. The model is
 built around the workload's shape, not raw core count.
 
 **Workload shape:** mostly I/O-bound with CPU bursts. Per source: dump/fetch (DB
