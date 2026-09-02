@@ -1,13 +1,13 @@
 name: Release
 
 # Branch-triggered, version-gated release — modelled on safelint's publish.yml,
-# adapted for Rust and this repo's gitflow (master = final, development = RC).
+# adapted for Rust and this repo's gitflow (main = final, development = RC).
 # The release signal is the version in Cargo.toml (a deliberate, committed edit):
 # when a push lands a commit that CHANGES the version to one not yet tagged, on
 # its expected branch, this workflow tags it, builds cross-platform binaries,
 # creates the GitHub release, and (optionally) publishes to crates.io.
 #
-#   final version   (0.2.0)      -> releases from master   as a full release
+#   final version   (0.2.0)      -> releases from main   as a full release
 #   pre-release     (0.2.0-rc.1) -> releases from development as a pre-release
 #
 # Adding this workflow (version unchanged) does NOT release — the gate fires only
@@ -18,7 +18,7 @@ name: Release
 #   2. add repo secret     CARGO_REGISTRY_TOKEN  (a crates.io API token)
 on:
   push:
-    branches: [master, development]
+    branches: [main, development]
   workflow_dispatch:
 
 permissions:
@@ -50,13 +50,13 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
           # semver pre-release (hyphen suffix, e.g. 0.2.0-rc.1) releases from
-          # development; a final version releases from master.
+          # development; a final version releases from main.
           if printf '%s' "$VERSION" | grep -qE '-'; then
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
             EXPECTED_BRANCH=development
           else
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
-            EXPECTED_BRANCH=master
+            EXPECTED_BRANCH=main
           fi
 
           PREV=$(git show HEAD~1:Cargo.toml 2>/dev/null | grep -m1 '^version' | sed -E 's/.*"([^"]+)".*/\1/' || true)

@@ -100,10 +100,10 @@ provided automatically inside the hook environment; to run it directly, install
 
 This repo follows a two-branch gitflow:
 
-- **`master`** — stable; final releases (`X.Y.Z`) ship from here.
+- **`main`** — stable; final releases (`X.Y.Z`) ship from here.
 - **`development`** — integration / RC branch; pre-releases (`X.Y.Z-rc.N`) ship
-  from here. Dependabot targets it, and it is auto-reset to `master` after each
-  master push (`sync-development.yml`).
+  from here. Dependabot targets it, and it is auto-reset to `main` after each
+  main push (`sync-development.yml`).
 
 Releases are **version-gated**: bumping the version in `Cargo.toml` on the matching
 branch tags it, builds cross-platform binaries, and creates the GitHub release

@@ -14,5 +14,5 @@
 /sources.yaml
 /*secrets*.yaml
 
-# AI-client local settings (the committed skill under .claude/skills/ stays tracked)
-.claude/settings.local.json
+# AI-client local files (skills, settings) — kept local, not tracked
+.claude/
