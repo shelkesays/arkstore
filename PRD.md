@@ -98,12 +98,12 @@ Representative use cases:
 
 ## 5. Supported Sources & Engines
 
-| Source type | Backup | Restore | Archive | Mechanism |
+| Source type | Backup | Restore | Archive | Mechanism (default) |
 |---|---|---|---|---|
-| PostgreSQL | ✅ | ✅ | ✅ | dump/restore via client tooling; archive via native async driver |
-| MySQL/MariaDB | ✅ | ✅ | ✅ | dump/restore via client tooling; archive via native driver |
-| MongoDB | ✅ | ✅ | ✅ | native driver for all ops |
-| Files/directories | ✅ | ✅ | ❌ | tar + compress a path tree |
+| PostgreSQL | ✅ | ✅ | ✅ | **hybrid**: native driver for data (`COPY`) + external `pg_dump`/`pg_restore` for full-fidelity schema; archive is fully native. See §5.1 |
+| MySQL/MariaDB | ✅ | ✅ | ✅ | **native** driver (`SHOW CREATE` for schema + streamed rows); external `mysqldump` optional |
+| MongoDB | ✅ | ✅ | ✅ | **native** driver (BSON dump/restore, `mongodump`-compatible layout) |
+| Files/directories | ✅ | ✅ | ❌ | tar + compress a path tree (pure Rust) |
 
 **Engine opt-in (Rust feature flags):** each engine is a Cargo feature (`postgres`, `mysql`,
 `mongo`, `archive`, `files`). A default build may include a common set (e.g. `postgres,archive`);
@@ -116,6 +116,36 @@ Prebuilt releases: publish a **full-feature** binary per platform, plus optional
 per-engine builds. Because it's one static binary, "install the right extra" becomes "download
 the right release asset."
 
+### 5.1 Dump strategy (native vs external)
+
+A goal is to be **truly self-contained** — no reliance on database client tools (`pg_dump`,
+`mysqldump`, `mongodump`) being installed and version-matched on the host. Wherever it can be
+done at full fidelity in pure Rust, backup/restore uses a **native** backend built on the
+engine's Rust driver; the external client tool is a fallback, not a requirement. (Archival is
+already fully native everywhere: it streams `SELECT`/`find` results to Parquet.)
+
+Feasibility differs by engine, and Arkstore's correctness-first stance sets the bar — a
+hand-rolled dump that silently omits an object is a restore-time data-loss risk, so native is
+adopted only where fidelity is assured:
+
+| Engine | Default strategy | How |
+|---|---|---|
+| **MongoDB** | **native** | `mongodb` + `bson` crates: dump every collection to BSON with a `metadata.json` (the `mongodump` layout); restore reads BSON and inserts. Full fidelity in pure Rust. |
+| **MySQL/MariaDB** | **native** | `sqlx`/`mysql_async`: schema via `SHOW CREATE TABLE/VIEW/TRIGGER` + routines, data via streamed `SELECT`, dependency-ordered. |
+| **PostgreSQL** | **hybrid** | Native driver streams table **data** via the `COPY` protocol, but full **schema** fidelity (extensions, custom types, partitioning, privileges, dependency ordering) is left to `pg_dump`/`pg_restore` — there is no pure-Rust tool that matches it. |
+
+This is exposed as a per-source (or global) **`dump_strategy`** setting:
+
+- `native` — pure Rust only; fails fast if the engine has no native backend for that operation.
+- `external` — shell out to the client tool (fidelity-guaranteed; requires it on `PATH`).
+- `auto` (default) — native where Arkstore has a proven backend (Mongo, MySQL), otherwise
+  external (Postgres full logical dump). Postgres **archive** and **data-only** paths are native
+  regardless.
+
+The net effect: Mongo and MySQL deployments need **no external tools at all**; only Postgres
+*full logical backup/restore* still wants `pg_dump`/`pg_restore` on `PATH` until a native
+Postgres dump is proven out (a roadmap item, §14).
+
 ---
 
 ## 6. Functional Requirements
@@ -123,9 +153,9 @@ the right release asset."
 ### 6.1 Backup (`arkstore backup`)
 
 - Iterate all **enabled** sources (or a single source via `--source <name>`).
-- For a **database** source: produce a dump using the engine's standard mechanism, stream it
-  through compression, and upload to object storage as `<source>.<timestamp>.tar.gz` (or the
-  engine-native dump format inside the archive).
+- For a **database** source: produce a dump using the source's **dump strategy** (native Rust
+  backend or external client tool — see §5.1), stream it through compression, and upload to
+  object storage as `<source>.<timestamp>.tar.gz` (the engine-native dump format inside the archive).
 - For a **file** source: tar + compress the configured path tree and upload the same way.
 - Maintain a **`latest` pointer** object per source (`<source>.latest.tar.gz`) updated on each run.
 - **Timestamped, immutable** versioned objects under `versioned/`; the latest pointer is the
@@ -146,7 +176,8 @@ the right release asset."
 - Select a backup to restore: the `latest` pointer (default) or a specific timestamp/key.
 - Download, decompress, and load into the configured **target** (which may differ from the
   backup source — restore to a staging DB, a different host, etc.).
-- Engine-appropriate load (native restore tooling for SQL, native driver for Mongo).
+- Engine-appropriate load per the **dump strategy** (§5.1): native Rust backend where available
+  (Mongo, MySQL), else the external client tool (`pg_restore`/`psql` for a Postgres full dump).
 - **Preview / safety:** confirm target before a destructive load; support `--dry-run` that
   reports what would be restored (source key, size, target) without writing.
 - Per-target failure isolation and meaningful exit codes.
@@ -236,7 +267,11 @@ Two layers, both declarative:
    default retention days, whole_months, delete_after_archive, dry_run, compression, fetch batch
    size), and `concurrency` (`max_sources`, `cpu_workers` — see §9.5).
 2. **Sources** (`sources.yaml`): a list of source entries — `name`, `type`, `enable`, connection
-   details, optional `archive` rules (block-YAML style), and restore target overrides.
+   details, optional `archive` rules (block-YAML style), `dump_strategy`
+   (`auto` | `native` | `external`, see §5.1), and restore target overrides.
+
+A global `dump_strategy` default may also live in the top-level config; a per-source value
+overrides it.
 
 Requirements:
 - Strongly typed deserialization (serde) with **clear validation errors** naming the offending
@@ -363,10 +398,11 @@ and Windows; one static binary per platform, built from one codebase.
 - **OS-agnostic by construction:** the crate uses cross-platform std and portable crates
   (`std::path::PathBuf`, `available_parallelism`, native `tar`/`flate2`/`zstd`/`arrow` rather than
   shelling out to `tar`/`gzip`), so archival and file backup have no OS-specific code path.
-- **DB dump tooling is the one OS-dependent edge:** where an engine shells out to a client tool
-  (`pg_dump`, `mysqldump`), that tool must be on `PATH`; the archive path (native drivers) needs
-  nothing external. Per-OS install notes cover this, and the roadmap includes native-driver
-  backup to remove the dependency entirely.
+- **The only OS-dependent edge is a Postgres *full logical* backup/restore** under the
+  `external` dump strategy, which needs `pg_dump`/`pg_restore` on `PATH` (see §5.1). Every other
+  path is pure Rust: Mongo and MySQL backup/restore use native backends, and all archival and
+  file operations need nothing external. Per-OS notes cover the Postgres case, and a native
+  Postgres dump is a roadmap item (§14) to close it.
 - **CI builds and tests on Linux, macOS, and Windows** on every change; the release workflow
   cross-builds the full target matrix on tags.
 - Container image: distroless/minimal base + the static binary; no interpreter, tiny image.
@@ -413,9 +449,12 @@ and Windows; one static binary per platform, built from one codebase.
   plumbing, one engine (Postgres) backup + restore.
 - **M1 — Cleanup:** full retention model, plan/execute/consolidate, audit trail, validation.
 - **M2 — Archive:** Postgres archive engine, Parquet writer, whole-months policy, verify-before-delete.
-- **M3 — Multi-engine:** MySQL + Mongo backup/restore/archive; file sources.
+- **M3 — Multi-engine + native backends:** MySQL + Mongo backup/restore/archive via **native
+  Rust** backends (no external tools), file sources; Postgres data via native `COPY` with
+  `pg_dump`/`pg_restore` for full schema (§5.1); the `dump_strategy` config knob.
 - **M4 — Distribution:** prebuilt releases, container image, docs site, `verify` operation.
-- **M5 — Extensions:** client-side encryption, additional object stores (GCS/Azure).
+- **M5 — Extensions:** native Postgres logical dump (retire the `pg_dump` dependency),
+  client-side encryption, additional object stores (GCS/Azure).
 
 ---
 
@@ -426,4 +465,7 @@ and Windows; one static binary per platform, built from one codebase.
 3. Restore target model — reuse source entries with overrides, or a separate `targets` list?
 4. Is a `verify` (round-trip restore) operation in scope for v1 or roadmap?
 5. Minimum supported object stores for v1 (AWS S3 + MinIO only, or GCS/Azure day one)?
+6. Native Postgres logical dump — is matching `pg_dump` fidelity (extensions, custom types,
+   partitioning, privileges) worth the effort/risk, or is `external` the permanent answer for
+   Postgres full backups?
 ```
