@@ -38,9 +38,12 @@ jobs:
           tool: mdbook
       - name: Build
         run: mdbook build
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: target/book
+          # v4+ excludes hidden files by default; mdBook emits `.nojekyll`, so
+          # keep hidden files in the artifact.
+          include-hidden-files: true
 
   deploy:
     needs: build
