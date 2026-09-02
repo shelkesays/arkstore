@@ -146,6 +146,22 @@ The net effect: Mongo and MySQL deployments need **no external tools at all**; o
 *full logical backup/restore* still wants `pg_dump`/`pg_restore` on `PATH` until a native
 Postgres dump is proven out (a roadmap item, §14).
 
+#### Why the native driver, not a REST API
+
+A database's real programmatic interface is its **binary wire protocol** over TCP (the Postgres
+and MySQL client/server protocols; MongoDB's BSON-over-TCP; each with bulk sub-protocols like
+Postgres `COPY` and logical replication). SQL is the *language* carried over that protocol — the
+protocol is the API, and it is exactly what the Rust drivers speak. Structure (DDL) is not a
+separate API either: it is read as data from the system catalogs (`pg_catalog` /
+`information_schema`, or MySQL `SHOW CREATE`).
+
+Neither engine ships a core **REST/HTTP** interface; REST layers (PostgREST, Supabase, Hasura,
+MySQL REST Service) are third-party add-ons *built on top of* the wire protocol. They are useful
+for application CRUD but the wrong tool for backup: row-by-row HTTP/JSON is far slower than the
+binary bulk path, adds a service dependency, and exposes no schema-dump fidelity. So the native
+strategy deliberately uses the **wire protocol via the driver** — the efficient, official,
+self-contained API — rather than a REST layer.
+
 ---
 
 ## 6. Functional Requirements
