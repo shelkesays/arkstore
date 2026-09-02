@@ -1,0 +1,47 @@
+# SafeLint configuration for Arkstore.
+#
+# Enables the full Rust-applicable rule set. The rules that SafeLint enables by
+# default already run (function_length, nesting_depth, complexity, no_recursion,
+# unbounded_loops, side_effects*, and the Rust-specific panic/unwrap/lock/mem/
+# truncating-cast/undocumented-unsafe/needless-mut/unchecked-arithmetic rules).
+# This file turns ON the ones that are disabled by default but still apply to Rust.
+
+fail_on = "error"
+
+# ── Disabled-by-default rules we want ON ────────────────────────────────────────
+[rules.interior_mutable_static] # SAFE307 — global mutable state via interior mutability
+enabled = true
+severity = "warning"
+
+[rules.blanket_suppression] # SAFE603 — un-scoped #[allow(...)] / suppressions
+enabled = true
+severity = "error"
+
+[rules.tainted_sink] # SAFE801 — untrusted input into a dangerous sink
+enabled = true
+severity = "error"
+
+[rules.return_value_ignored] # SAFE802 — discarded return of an error-signalling call
+enabled = true
+severity = "warning"
+
+[rules.null_dereference] # SAFE803 — use-after-None-check / possible None deref
+enabled = true
+severity = "error"
+
+# ── Left OFF deliberately ───────────────────────────────────────────────────────
+# missing_assertions (SAFE601): heuristic, noisy for this codebase.
+[rules.missing_assertions]
+enabled = false
+
+# test_existence / test_coupling (SAFE701/702): enable once M0 adds a test suite —
+# with no tests yet they would fire on every source file and block every commit.
+[rules.test_existence]
+enabled = false
+test_dirs = ["tests"]
+severity = "warning"
+
+[rules.test_coupling]
+enabled = false
+test_dirs = ["tests"]
+severity = "warning"
