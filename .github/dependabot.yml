@@ -5,7 +5,7 @@ updates:
   - package-ecosystem: "cargo"
     directory: "/"
     # Raise bumps against development (the RC branch) so they flow through the
-    # development -> master release path and never diverge master from development.
+    # development -> main release path and never diverge main from development.
     target-branch: "development"
     schedule:
       interval: "weekly"

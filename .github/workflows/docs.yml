@@ -7,7 +7,7 @@ name: Docs
 # "GitHub Actions". Then the site is served at https://shelkesays.github.io/Arkstore/.
 on:
   push:
-    branches: [master]
+    branches: [main]
     paths:
       - "guide/**"
       - "book.toml"
