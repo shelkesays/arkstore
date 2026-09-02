@@ -327,10 +327,11 @@ OS-specific code path**.
 - Uses cross-platform std and portable crates: `std::path::PathBuf`,
   `available_parallelism`, and native `tar`/`flate2`/`zstd`/`arrow` rather than
   shelling out to `tar`/`gzip`.
-- The **one OS-dependent edge** is DB dump tooling: engines that shell out to a
-  client (`pg_dump`, `mysqldump`) need it on `PATH`. The archive path uses native
-  drivers and needs nothing external; the roadmap adds native-driver backup to
-  remove the dependency entirely.
+- The **only OS-dependent edge** is a Postgres *full logical* backup/restore under
+  the `external` dump strategy (`pg_dump`/`pg_restore` on `PATH`). Mongo and MySQL
+  backup/restore use native Rust backends, and all archival + file ops need nothing
+  external. See the dump-strategy design in [PRD §5.1](../PRD.md). A native Postgres
+  dump is a roadmap item to close even that edge.
 - Prebuilt release binaries: Linux `x86_64` (gnu + musl) + `aarch64`, macOS
   `aarch64` + `x86_64`, Windows `x86_64`. CI builds/tests on all three OSes; the
   release workflow cross-builds the matrix on version tags.
