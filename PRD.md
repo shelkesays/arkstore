@@ -6,7 +6,7 @@
 
 - **Status:** Draft v0.1 (reverse-engineered requirements + forward-looking design)
 - **Owner:** @shelkesays
-- **Repo:** https://github.com/shelkesays/Arkstore (existing Python repo → reset to Rust)
+- **Repo:** https://github.com/shelkesays/arkstore (existing Python repo → reset to Rust)
 - **License:** MIT
 - **Language:** Rust (no `unsafe` in the crate; `#![forbid(unsafe_code)]`)
 
