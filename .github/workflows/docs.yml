@@ -4,7 +4,7 @@ name: Docs
 # docs.yml (mkdocs -> gh-pages), using mdBook + the native Pages deployment.
 #
 # One-time setup: repo Settings -> Pages -> Build and deployment -> Source:
-# "GitHub Actions". Then the site is served at https://shelkesays.github.io/Arkstore/.
+# "GitHub Actions". Then the site is served at https://shelkesays.github.io/arkstore/.
 on:
   push:
     branches: [main]

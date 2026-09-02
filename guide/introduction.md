@@ -28,4 +28,4 @@ statically linked binary; engines compiled in as opt-in Cargo features).
   archive whole-months policy, the cleanup plan schema, S3 layouts, and lifecycle
   guidance.
 
-Source and issue tracker: <https://github.com/shelkesays/Arkstore>.
+Source and issue tracker: <https://github.com/shelkesays/arkstore>.
