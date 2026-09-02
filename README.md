@@ -111,7 +111,7 @@ branch tags it, builds cross-platform binaries, and creates the GitHub release
 
 ## Documentation
 
-Rendered guide (mdBook): **<https://shelkesays.github.io/Arkstore/>**
+Rendered guide (mdBook): **<https://shelkesays.github.io/arkstore/>**
 
 - [`PRD.md`](PRD.md) — product requirements and design.
 - [`docs/knowledge-base.md`](docs/knowledge-base.md) — the detailed behavioral

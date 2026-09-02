@@ -9,9 +9,9 @@ language = "en"
 build-dir = "target/book"
 
 [output.html]
-site-url = "/Arkstore/"
-git-repository-url = "https://github.com/shelkesays/Arkstore"
-edit-url-template = "https://github.com/shelkesays/Arkstore/edit/main/guide/{path}"
+site-url = "/arkstore/"
+git-repository-url = "https://github.com/shelkesays/arkstore"
+edit-url-template = "https://github.com/shelkesays/arkstore/edit/main/guide/{path}"
 default-theme = "rust"
 preferred-dark-theme = "ayu"
 
