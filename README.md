@@ -14,6 +14,7 @@ database and file backups:
 - **`restore`** — reconstruct a database or file tree from a chosen backup.
 - **`cleanup`** — apply calendar-tier retention (daily / weekly / monthly / yearly) to stored backups.
 - **`archive`** — move aged rows out of a live database into Parquet, keeping only a recent window in the source.
+- **`verify`** — round-trip a backup into a throwaway target and diff it against the manifest baseline.
 
 It is **config-driven**, **safe by default** (dry-run everywhere, delete only
 after an upload is verified, never deletes a key it can't parse), and **portable**
@@ -39,6 +40,10 @@ binary, true parallelism, streaming I/O, and a strongly typed config.
 | MongoDB | ✅ | ✅ | ✅ | `mongo` |
 | Files / directories | ✅ | ✅ | — | `files` |
 
+Every engine is driven **natively over its wire protocol** by a pure-Rust driver
+compiled into the binary — `pg_dump`, `mysqldump`, and `mongodump` are never
+required, invoked, or shipped. Each backup is taken in one consistent snapshot.
+
 Engines are **opt-in at compile time**. Using an engine that wasn't built into
 the binary fails fast with a clear rebuild message. The default build is
 `postgres,archive,files`; `--features full` (or `--all-features`) builds everything.
@@ -60,6 +65,7 @@ arkstore backup   [--source <name>] [--dry-run]
 arkstore restore  [--source <name>] [--dry-run]
 arkstore cleanup  [generate-plan | execute-plan | run | consolidate-plans] [--source <name>] [--dry-run]
 arkstore archive  [--source <name>] [--dry-run]
+arkstore verify   [--source <name>] [--from <stamp|latest>] [--dry-run]
 
 # global: --config <path>  --log-level <level>
 ```
@@ -123,12 +129,12 @@ The site is built from `guide/` (which includes `PRD.md` and
 
 ## Roadmap
 
-- **M0** — CLI, config/secrets, object-store abstraction, Postgres backup + restore. *(in progress)*
+- **M0** — CLI, config/secrets, object-store abstraction, native Postgres backup + restore, first `verify`. *(in progress)*
 - **M1** — full cleanup: retention model, plan/execute/consolidate, audit trail.
 - **M2** — archive: Postgres engine, Parquet writer, whole-months policy.
-- **M3** — MySQL + Mongo backup/restore/archive; file sources.
-- **M4** — prebuilt releases, container image, docs, a `verify` (round-trip) op.
-- **M5** — client-side encryption; additional object stores (GCS/Azure).
+- **M3** — native MySQL + Mongo backup/restore/archive; file sources; `verify` for each.
+- **M4** — prebuilt releases, binary-only container image, docs.
+- **M5** — client-side encryption; additional object stores (GCS/Azure); Mongo oplog consistency.
 
 ## License
 

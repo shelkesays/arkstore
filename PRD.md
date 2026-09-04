@@ -31,6 +31,8 @@ database and file backups against S3-compatible object storage:
 3. **Cleanup** — apply calendar-tier retention (daily/weekly/monthly/yearly) to stored backups.
 4. **Archive** — move aged rows out of a live database into columnar (Parquet) files in
    object storage, keeping only a recent window in the source table.
+5. **Verify** — prove a backup is restorable: round-trip it into a throwaway target and diff it
+   against the baseline recorded at dump time.
 
 It is **config-driven** (declarative source definitions + global policy), **safe by default**
 (dry-run everywhere, delete-after-verify, never deletes what it can't parse), and **portable**
@@ -48,7 +50,7 @@ convention, a retention script that eventually deletes the wrong thing, and — 
 log/event tables — an ad-hoc "move old rows somewhere cheaper" job. These are generic,
 well-understood capabilities, but the glue is fragile and rarely reusable across engines.
 
-Arkstore consolidates the four operations behind one declarative config and one binary, with a
+Arkstore consolidates these operations behind one declarative config and one binary, with a
 correctness bias: every destructive path is preview-first and verify-before-delete.
 
 **Why Rust:** memory safety without a GC, a single dependency-free static binary (no Python
@@ -69,7 +71,8 @@ fresh in Rust from these requirements.
 ## 3. Goals & Non-Goals
 
 ### Goals
-- One binary, four operations, one declarative config.
+- One binary, five operations, one declarative config — and **no database client tools**: every
+  engine is driven over its wire protocol from inside the binary (§5.1).
 - **Opt-in engines** at compile time (Cargo features) and clear runtime errors when an engine
   isn't built in — never a cryptic failure.
 - **Safety first:** dry-run for every destructive operation; delete only after upload is
@@ -109,13 +112,17 @@ Representative use cases:
 
 | Source type | Backup | Restore | Archive | Mechanism (default) |
 |---|---|---|---|---|
-| PostgreSQL | ✅ | ✅ | ✅ | **hybrid**: native driver for data (`COPY`) + external `pg_dump`/`pg_restore` for full-fidelity schema; archive is fully native. See §5.1 |
-| MySQL/MariaDB | ✅ | ✅ | ✅ | **native** driver (`SHOW CREATE` for schema + streamed rows); external `mysqldump` optional |
-| MongoDB | ✅ | ✅ | ✅ | **native** driver (BSON dump/restore, `mongodump`-compatible layout) |
+| PostgreSQL | ✅ | ✅ | ✅ | **native** wire-protocol driver: schema from the system catalogs, data via the `COPY` sub-protocol, one consistent snapshot. See §5.1 |
+| MySQL/MariaDB | ✅ | ✅ | ✅ | **native** wire-protocol driver: `SHOW CREATE …` for schema, streamed rows, consistent snapshot. See §5.1 |
+| MongoDB | ✅ | ✅ | ✅ | **native** wire-protocol driver: BSON per collection + index/option metadata (`mongodump`-compatible layout). See §5.1 |
 | Files/directories | ✅ | ✅ | ❌ | tar + compress a path tree (pure Rust) |
 
+**No database client tools — ever.** Every engine is driven over its own wire protocol by a pure-Rust
+driver compiled into the binary. `pg_dump`, `mysqldump`, `mongodump` and their restore
+counterparts are never invoked, never required on `PATH`, and never shipped in the container image.
+
 **Engine opt-in (Rust feature flags):** each engine is a Cargo feature (`postgres`, `mysql`,
-`mongo`, `archive`, `files`). A default build may include a common set (e.g. `postgres,archive`);
+`mongo`, `archive`, `files`). The default build is `postgres,archive,files`;
 `--all-features` builds everything. Using an engine that wasn't compiled in fails fast with a
 clear message: *"PostgreSQL support was not built into this binary. Rebuild with
 `--features postgres` or download the full release."* — the same "opt in to the engines you use"
@@ -125,37 +132,94 @@ Prebuilt releases: publish a **full-feature** binary per platform, plus optional
 per-engine builds. Because it's one static binary, "install the right extra" becomes "download
 the right release asset."
 
-### 5.1 Dump strategy (native vs external)
+### 5.1 Native wire-protocol backends (no client tools)
 
-A goal is to be **truly self-contained** — no reliance on database client tools (`pg_dump`,
-`mysqldump`, `mongodump`) being installed and version-matched on the host. Wherever it can be
-done at full fidelity in pure Rust, backup/restore uses a **native** backend built on the
-engine's Rust driver; the external client tool is a fallback, not a requirement. (Archival is
-already fully native everywhere: it streams `SELECT`/`find` results to Parquet.)
+Arkstore is **fully self-contained**: backup, restore, and archive for every engine are performed
+by a pure-Rust driver speaking the engine's **wire protocol**, compiled into the binary. There is
+no "external" strategy and no `dump_strategy` knob — one code path per engine.
 
-Feasibility differs by engine, and Arkstore's correctness-first stance sets the bar — a
-hand-rolled dump that silently omits an object is a restore-time data-loss risk, so native is
-adopted only where fidelity is assured:
+**Why this is sound, not a compromise.** `pg_dump`, `mysqldump`, and `mongodump` are themselves
+nothing more than ordinary wire-protocol clients: they hold no privileged access and use no server
+facility a driver cannot. Schema is *data* read from the catalogs — Postgres exposes
+`pg_get_viewdef()`, `pg_get_functiondef()`, `pg_get_indexdef()`, `pg_get_constraintdef()`, and
+`pg_get_triggerdef()`, and tables are assembled from `pg_attribute`/`pg_type`/`pg_attrdef`; MySQL
+hands DDL back directly via `SHOW CREATE …`; Mongo via `listCollections`/`listIndexes`. Bulk data
+moves over each protocol's bulk path (Postgres `COPY`, MySQL streamed result sets, Mongo cursors).
+Everything those tools do is therefore reimplementable. What they *guarantee* that a naive dump
+lacks — **consistency** and **fidelity** — becomes an explicit requirement here (§5.1.1, §5.1.2)
+rather than something inherited by shelling out.
 
-| Engine | Default strategy | How |
-|---|---|---|
-| **MongoDB** | **native** | `mongodb` + `bson` crates: dump every collection to BSON with a `metadata.json` (the `mongodump` layout); restore reads BSON and inserts. Full fidelity in pure Rust. |
-| **MySQL/MariaDB** | **native** | `sqlx`/`mysql_async`: schema via `SHOW CREATE TABLE/VIEW/TRIGGER` + routines, data via streamed `SELECT`, dependency-ordered. |
-| **PostgreSQL** | **hybrid** | Native driver streams table **data** via the `COPY` protocol, but full **schema** fidelity (extensions, custom types, partitioning, privileges, dependency ordering) is left to `pg_dump`/`pg_restore` — there is no pure-Rust tool that matches it. |
+**Drivers (pure Rust, no C, statically linkable):** Postgres — `tokio-postgres` (or `sqlx`'s native
+Postgres driver), which implements `COPY … TO STDOUT` / `COPY … FROM STDIN`; MySQL — `mysql_async`
+(or `sqlx` MySQL); MongoDB — the official `mongodb` crate with `bson`. TLS via `rustls`, never
+OpenSSL, so the musl static build stays free of system libraries.
 
-This is exposed as a per-source (or global) **`dump_strategy`** setting:
+#### 5.1.1 Consistency: one snapshot per source (required)
 
-- `native` — pure Rust only; fails fast if the engine has no native backend for that operation.
-- `external` — shell out to the client tool (fidelity-guaranteed; requires it on `PATH`).
-- `auto` (default) — native where Arkstore has a proven backend (Mongo, MySQL), otherwise
-  external (Postgres full logical dump). Postgres **archive** and **data-only** paths are native
-  regardless.
+A backup must be **transactionally consistent across all objects** of a source, exactly as the
+classic tools guarantee (`pg_dump` runs in one `REPEATABLE READ` transaction; `mysqldump
+--single-transaction` does the same). A set of per-table reads taken at different moments is not a
+backup — it is a collection of mutually inconsistent tables. Native dumps must therefore:
 
-The net effect: Mongo and MySQL deployments need **no external tools at all**; only Postgres
-*full logical backup/restore* still wants `pg_dump`/`pg_restore` on `PATH` until a native
-Postgres dump is proven out (a roadmap item, §15).
+- **PostgreSQL** — open one `REPEATABLE READ` read-only transaction for the whole source and read
+  every catalog and table inside it. When tables are dumped **in parallel**, export that
+  transaction's snapshot with `pg_export_snapshot()` and have every worker connection adopt it via
+  `SET TRANSACTION SNAPSHOT`, so all workers see the identical point in time.
+- **MySQL/MariaDB** — `START TRANSACTION WITH CONSISTENT SNAPSHOT` at `REPEATABLE READ` on InnoDB.
+  MySQL cannot share a snapshot across connections, so the tables of one MySQL source are dumped
+  **sequentially on the snapshot connection** (parallelism stays at the source level). Non-
+  transactional engines (MyISAM) cannot be snapshotted — surfaced as a per-table warning and
+  documented as a limitation.
+- **MongoDB** — there is **no cross-collection snapshot** without the oplog. v1 dumps each
+  collection with a single cursor; cross-collection point-in-time consistency is out of scope and
+  stated plainly in the docs (an oplog-based mode is a roadmap item, §15).
 
-#### Why the native driver, not a REST API
+A dump that cannot establish its snapshot **fails the source before reading any data**.
+
+#### 5.1.2 Fidelity contract
+
+"Full fidelity" is defined, not asserted. The native backends must capture and restore:
+
+- **PostgreSQL** — schemas; tables (columns, types, defaults, identity/serial, generated columns,
+  `NOT NULL`, collation); primary/unique/foreign-key/check/exclusion constraints; indexes
+  (including partial/expression); sequences **and their current values**; views and materialized
+  views (dependency-ordered); functions/procedures; triggers; user-defined types (enum, composite,
+  domain, range); extensions (as `CREATE EXTENSION`); comments; declarative partitioning (parents,
+  partitions, attachment); row-level-security policies when present. **Ownership and privileges
+  (`OWNER TO`, `GRANT`) are opt-in** (`include_privileges`, default off) so dumps are portable across
+  roles by construction. Large objects (`pg_largeobject`) and replication slots are **out of scope
+  for v1** (documented).
+- **MySQL/MariaDB** — tables (`SHOW CREATE TABLE`, incl. engine, charset/collation, `AUTO_INCREMENT`
+  value, generated columns); views (dependency-ordered); triggers; stored routines and events
+  (`SHOW CREATE …`); foreign keys.
+- **MongoDB** — every collection's documents as BSON; indexes (`listIndexes`); collection options
+  (capped, validators, collation); views.
+
+Anything outside the contract that a backend encounters is **logged as unsupported**, never
+silently dropped — and the completeness gate (§6.1) still applies to every listed object.
+
+#### 5.1.3 Archive file formats (what lands in the tar)
+
+| Engine | Structure file | Data file | Restore path |
+|---|---|---|---|
+| PostgreSQL | `<obj>.schema.sql` — DDL Arkstore emits, portable by construction | `<obj>.data.copy` — `COPY … TO STDOUT` **text** format (`\N` nulls). Binary `COPY` is an opt-in for same-version/same-architecture speed; text is the portable default | apply DDL, then `COPY … FROM STDIN` |
+| MySQL/MariaDB | `<obj>.schema.sql` — `SHOW CREATE …` output | `<obj>.data.tsv` — tab-separated, backslash-escaped, `\N` nulls (the server's own text row format) | apply DDL, then batched multi-row `INSERT` (never `LOAD DATA LOCAL INFILE`, which needs server-side opt-in) |
+| MongoDB | `<coll>.metadata.json` — indexes + options | `<coll>.bson` | `insertMany` batches, then `createIndexes` |
+
+Every archive carries `manifest.json` (§6.1), which also records each object's **dependency graph**
+(foreign-key parents, view dependencies), its **row/document count**, and (SQL engines) an
+**order-independent content hash** as seen in the snapshot — the inputs for restore ordering (§6.2)
+and `verify` (§6.5).
+
+#### 5.1.4 Supported server versions
+
+Catalog layouts change across releases, so each backend declares a **supported server-version
+range** and version-gates its catalog queries; connecting to an unsupported version fails fast with
+a clear message rather than producing a dump of unknown fidelity. Initial targets: PostgreSQL 13+,
+MySQL 8.0+ / MariaDB 10.6+, MongoDB 5.0+ — widened only as the fidelity suite (§6.5) passes for a
+version.
+
+#### 5.1.5 Why the wire protocol, not a REST API
 
 A database's real programmatic interface is its **binary wire protocol** over TCP (the Postgres
 and MySQL client/server protocols; MongoDB's BSON-over-TCP; each with bulk sub-protocols like
@@ -184,8 +248,9 @@ or a single named source via `--source <name>`.
 
 1. **Enumerate the objects to dump** (tables / collections) from the live source, then apply the
    source's ignore rules (below).
-2. **Dump each object** using the source's **dump strategy** (native Rust backend or external
-   client tool — see §5.1). What is dumped per object is governed by two per-source toggles:
+2. **Dump each object** through the engine's **native wire-protocol backend** (§5.1), inside the
+   source's single consistent snapshot (§5.1.1). What is dumped per object is governed by two
+   per-source toggles:
    - **`structure`** (schema/DDL) — when true, dump the object's definition.
    - **`data`** (rows/documents) — when true, dump the object's contents.
    A source may back up structure-only, data-only, or both.
@@ -193,9 +258,12 @@ or a single named source via `--source <name>`.
    A backup archive is all-or-nothing; a partial archive that silently omits an object is a
    restore-time data-loss trap and must never be produced.
 4. **Write a manifest** (database sources) — a `manifest.json` inside the archive recording a
-   format version, the source name and engine type, a creation timestamp, and one entry per
-   dumped file with its `{path, object_name, size, sha256}`. This is the integrity record the
-   restore path validates against (§6.2).
+   format version, the source name, engine type and **server version**, a creation timestamp, the
+   snapshot identity, and one entry per dumped file with its `{path, object_name, kind, size,
+   sha256}`. Per object it also records the **dependency graph** (FK parents, view dependencies),
+   the **row/document count**, and (SQL engines) an **order-independent content hash** observed in
+   the snapshot. This is the integrity record restore validates against (§6.2) and the baseline
+   `verify` compares to (§6.5).
 5. **Package** — tar + stream through compression to a timestamped archive.
 6. **Upload** (when `backup_to_s3` is enabled) to object storage, then **verify** the upload
    (size / checksum) before declaring success. A source may be configured local-only
@@ -231,8 +299,9 @@ File sources honour `ignore` / `ignore_startswith` (fnmatch on the entry basenam
 
 **Invariants:**
 
-- Per-source **failure isolation**: one source failing (bad creds, missing tool, upload error)
-  is logged and recorded; the run continues. Exit `1` if any source failed, else `0`.
+- Per-source **failure isolation**: one source failing (bad credentials, unreachable host,
+  snapshot failure, upload error) is logged and recorded; the run continues. Exit `1` if any
+  source failed, else `0`.
 - An empty / no-match source selection is a clean warning, not an error.
 - Never require network egress beyond the DB and the object store.
 
@@ -291,7 +360,7 @@ sub-action style, not a `--action` flag.)
 2. Build the engine loader (fails fast if that engine wasn't compiled in — §5).
 3. **Prove the target is empty before downloading or extracting** (a non-empty target aborts
    early, before any transfer), unless it is a local single-dump restore.
-4. Resolve `--from`, download, and **safely extract** the archive (see §8 extraction hardening).
+4. Resolve `--from`, download, and **safely extract** the archive (see §9.6 extraction hardening).
 5. **Validate the archive against its `manifest.json`.** The manifest is the authority on **which
    files each object is expected to have** — so "missing" always means *missing relative to what the
    manifest records*, never "a file some other object type would have." For each object the manifest
@@ -301,17 +370,18 @@ sub-action style, not a `--action` flag.)
      §6.1) legitimately has **no** data file — that is expected, not a failure; it is recreated
      empty (§6.2 structure-only).
    - A **structure file the manifest records** that is missing/mismatched is non-fatal **only when
-     the object's schema is otherwise available** — the data file is self-describing (carries its
-     own DDL, as a full per-table dump does) *or* the target already defines the object; the
-     restorer then falls back to deriving FK order (step 6) from the data file. Otherwise — a
-     genuinely **data-only** object whose target has no matching schema and whose data file carries
-     no DDL — the object **fails** rather than loading partial/unusable data.
+     the target already defines the object** (its rows are then loaded into the existing schema).
+     Native data files carry **no DDL** (§5.1.3), so there is no "self-describing data file"
+     fallback: if the target lacks the object, it **fails** rather than loading partial or
+     unusable data.
+   - A **data-only** object (`structure: false`) likewise requires the target to already define it.
    The never-silently-incomplete rule wins: an object is "restored" only if the files the manifest
    promised are intact and its schema exists or is created.
-6. **Compute load order** — parse foreign-key relationships and topologically **layer** the
-   objects so parents load before children (Mongo is a single layer). Cyclic dependencies are
-   handled by loading the tables with **foreign-key application deferred**, then applying the
-   deferred constraints in a final pass.
+6. **Compute load order** from the **dependency graph recorded in the manifest** (captured from the
+   catalogs at dump time — no parsing of SQL text): topologically **layer** the objects so parents
+   load before children and views after their base relations (Mongo is a single layer). Cyclic
+   foreign-key dependencies are handled by creating the tables and loading their data with
+   **foreign-key constraints deferred**, then applying the deferred constraints in a final pass.
 7. **Load** each object per its layer, then verify presence of the expected objects. Per-object
    **failure isolation**: a failed object is recorded and skipped, never aborting the run
    mid-way.
@@ -321,21 +391,30 @@ sub-action style, not a `--action` flag.)
 **Structure-only restore:** an object that was backed up structure-only (or was in the `ignore`
 data-skip set, §6.1) is **recreated empty** from its structure file when no data file is present.
 
-**Single-item restore:** a local single dump file (`.sql` / engine archive) can be restored on its
-own; the target object must be **absent or empty** first. (Single-item file restore is not
+**Single-item restore:** a single object's Arkstore-produced dump (its structure and/or data file,
+with the manifest) can be restored on its own; the target object must be **absent or empty** first.
+Because it is one object, no dependency ordering applies. (Single-item file restore is not
 supported — file restores go through the full-tree path.)
 
-**Engine load specifics (see §5.1 for the dump-strategy split):**
+**Engine load mechanics (native, §5.1):**
 
-- Native Rust backend where available (Mongo, MySQL); otherwise the external client tool
-  (`pg_restore` / `psql`) for a Postgres full logical dump.
-- **SQL preprocessing** before load makes dumps portable across servers and privilege levels:
-  strip ownership (`ALTER … OWNER TO`) and `GRANT`/`REVOKE`, drop server-version-specific
-  statements the target can't accept (e.g. a newer server's `SET transaction_timeout`), and defer
-  `ADD CONSTRAINT … FOREIGN KEY` for cycle handling — all of it **`COPY`-block aware** so data
-  blocks are never corrupted.
-- **Retry-with-fallback:** if a permission error blocks disabling constraint triggers
-  (`session_replication_role = replica`), retry the load once without it rather than failing.
+- **PostgreSQL** — apply each object's `schema.sql` over the driver, then stream its `data.copy`
+  via `COPY … FROM STDIN`; restore sequence values last. Constraint-trigger suppression
+  (`SET session_replication_role = replica`) is attempted for speed and FK-cycle tolerance, with
+  **retry-with-fallback**: if a permission error blocks it, the load is retried once without it
+  rather than failing.
+- **MySQL/MariaDB** — apply DDL, then load `data.tsv` as **batched multi-row `INSERT`** statements
+  under session settings `FOREIGN_KEY_CHECKS=0, UNIQUE_CHECKS=0` (restored afterwards). `LOAD DATA
+  LOCAL INFILE` is deliberately **not** used — it requires server-side opt-in and is a deployment
+  landmine.
+- **MongoDB** — create each collection with its recorded options, `insertMany` in batches, then
+  `createIndexes` from `metadata.json`.
+- **Portable DDL by construction** — because Arkstore emits the DDL it restores, ownership and
+  privileges are simply **not emitted** unless `include_privileges` is on, foreign-key constraints
+  are emitted separately so they can be deferred, and no server-version-specific statements are
+  ever written. There is therefore **no text-preprocessing step** (no regex stripping of
+  `OWNER TO`/`GRANT`, no `COPY`-block-aware rewriting): portability is a property of the dump, not
+  a repair applied at load time.
 
 **Preview / safety:** `--dry-run` runs every check and computes the load order but writes nothing;
 per-target failure isolation and meaningful exit codes throughout.
@@ -413,6 +492,25 @@ Moves aged rows from a live DB table to **Parquet** in object storage, keeping a
 # e.g. archive/appdb/logs/logs.2026-04.parquet
 ```
 
+### 6.5 Verify (`arkstore verify`)
+
+Verification proves a backup is restorable — the safety net that makes native dumps trustworthy
+(§13.12).
+
+- **Select** a backup exactly as restore does (`--from`, default `latest`).
+- **Restore it into a throwaway target** — a `targets` entry flagged `ephemeral`, or a target
+  Arkstore creates for the run — through the normal restore path (§6.2): same code, same guards;
+  the never-production guard applies unchanged.
+- **Compare** the result against the **manifest baseline** captured at dump time (§6.1): every
+  expected object exists; per-object row/document counts match; for SQL engines the per-table
+  **order-independent content hash** matches the value recorded in the snapshot; for Mongo, document
+  counts and index definitions match.
+- **Report** `{verified, mismatched, failed}` per object with reasons; exit `1` on any mismatch.
+- **Tear down** the throwaway target only if Arkstore created it; never touch a pre-existing one.
+
+`verify` runs on demand and in CI against containerized engines for every backend, gating the
+fidelity contract (§5.1.2). `--dry-run` reports what would be verified without restoring.
+
 ---
 
 ## 7. Configuration Model
@@ -429,17 +527,15 @@ Three declarative layers:
    - `concurrency` — `max_sources`, `cpu_workers` (§9.5).
 2. **Sources** (`sources.yaml`): a list of source entries. Common: `name`, `type`
    (`postgre` | `mysql` | `mongo` | `file`), `enable`. Databases add connection details
-   (`host`, `port`, `user`, password-via-secret), and per source: `structure`, `data`,
-   `ignore_startswith`, `ignore`, `backup_to_s3`, `delete_after_upload`, `local_retention`,
-   optional `archive` rules (block-YAML style), and `dump_strategy` (`auto` | `native` |
-   `external`, see §5.1). File sources add `path`, `ignore_extensions`. Mongo adds
-   `authentication_database` (defaults to the db name).
+   (`host`, `port`, `user`, password-via-secret, optional TLS settings), and per source:
+   `structure`, `data`, `ignore_startswith`, `ignore`, `include_privileges` (Postgres/MySQL,
+   default `false` — §5.1.2), `backup_to_s3`, `delete_after_upload`, `local_retention`, and
+   optional `archive` rules (block-YAML style). File sources add `path`, `ignore_extensions`. Mongo
+   adds `authentication_database` (defaults to the db name).
 3. **Targets** (`targets.yaml`, optional): named restore targets — DBs `name`, `host`, `db`,
    `user`, password-via-secret, optional `port` and Mongo `auth_db`; file `name`, `path`. A missing
    targets file is not an error; targets may also be given inline as `restore.target` or overridden
    entirely by CLI/env (§6.2).
-
-A global `dump_strategy` default may live in the top-level config; a per-source value overrides it.
 
 Requirements:
 - Strongly typed deserialization (serde) with **clear validation errors** naming the offending
@@ -473,11 +569,11 @@ Requirements:
 - The secret payload may also carry logging/observability config (e.g. ship logs to a collector),
   so a prod deployment can route logs centrally while local runs print to console.
 - Never log secret values; redact connection strings in output.
-- **Passwords are never passed on the command line** to child tools or captured in argv. Each
-  engine uses its safe channel — an environment variable the client tool reads
-  (`PGPASSWORD` / `MYSQL_PWD`), or a mode-`0600` temporary credentials file for tools that need one
-  (Mongo) — deleted after use. A restore target password may additionally come from an interactive
-  prompt on a TTY, never from argv (§9.6).
+- **Credentials never touch the command line, a child process's environment, or a temp file** —
+  there are no child processes (§5.1). Passwords flow from the secret store straight into the
+  driver's in-memory connection configuration, are held in zeroizing buffers, and are dropped once
+  the connection is established. Nothing is ever written to disk or `argv`. A restore target
+  password may additionally come from an interactive prompt on a TTY (§9.6) — again in-memory only.
 
 ---
 
@@ -543,9 +639,13 @@ Two independent limits, resolved from the `concurrency` config block:
 
 Design choices and rationale:
 
-- **Async tasks, not processes.** Threads/async avoid per-process cost and secret/config sharing
-  complexity; crash isolation for the risky part already comes free because dump tools run as
-  child processes at that boundary.
+- **Async tasks, not processes — and no child processes at all.** Every engine is driven in-process
+  over its wire protocol (§5.1), so there is nothing to fork. Threads/async avoid per-process cost
+  and secret/config sharing complexity. **Failure isolation is `Result`-based:** each source runs
+  as its own task whose errors are collected, never propagated as a crash. A **panic is not an
+  isolable failure** — the release profile uses `panic = "abort"`, so a panic ends the whole run by
+  design (fail-fast on a bug). That is exactly why the codebase forbids `unwrap`/`expect`/`panic!`
+  in non-test code (SafeLint): the invariant is "errors are values", not "panics are caught".
 - **The real limiter is the DB and object store**, not local hardware: many heavy dumps against
   one shared instance hurt production, and many parallel uploads invite object-store throttling
   (needs retry/backoff). A later refinement is a **per-host cap** so sources sharing a database
@@ -577,11 +677,15 @@ whose contents originate outside the tool), so the following are hard requiremen
 - **Identifier validation.** Table/collection identifiers derived from untrusted dump/file names
   are validated against a strict charset and safely quoted before use in any statement — no
   interpolation of unvalidated names.
-- **Error redaction.** When a child tool fails, surface only its exit code and a safe message —
-  never its argv, stdout, or stderr, which can carry connection strings or secrets.
-- **Signal handling.** A user interrupt (Ctrl-C / SIGINT) aborts promptly and cleanly, cleaning up
-  temp working directories, and exits with the conventional interrupted code (`130`); an interrupt
-  during a child dump tool is surfaced as an interrupt, not a spurious failure.
+- **Error redaction.** Driver and object-store errors are surfaced through Arkstore's own error
+  types with connection strings, credentialed hosts, and secret values **redacted** before they
+  reach a log line, a summary, or an error-reporting sink. Raw driver error text is never echoed
+  verbatim.
+- **Signal handling.** A user interrupt (Ctrl-C / SIGINT) cancels in-flight tasks promptly and
+  cleanly: open database transactions are rolled back, partially written uploads are aborted (no
+  dangling multipart uploads), temp working directories are removed, and the process exits with
+  the conventional interrupted code (`130`). Because all work is in-process, cancellation is a
+  cooperative task cancel — there is no child process to reap.
 
 ---
 
@@ -597,6 +701,7 @@ arkstore restore  [restore | list-backups]
 arkstore cleanup  [generate-plan | execute-plan <plan> | run | consolidate-plans]
                   [--source <name>] [--dry-run]
 arkstore archive  [--source <name>] [--dry-run]
+arkstore verify   [--source <name>] [--from <stamp|key|latest>] [--target <name>] [--dry-run]
 
 Global: --config, --log-level, --timezone, --version, --help
 ```
@@ -618,6 +723,7 @@ Global: --config, --log-level, --timezone, --version, --help
 and Windows; one static binary per platform, built from one codebase.
 
 - **Single static binary** per platform (musl for Linux to avoid glibc coupling); no runtime deps.
+  TLS is `rustls`, never OpenSSL, so the musl build has no system-library dependency.
 - **Prebuilt release binaries** for every supported target, published on GitHub Releases with
   checksums (see the release workflow):
   - Linux `x86_64` (gnu + musl) and `aarch64`
@@ -628,15 +734,14 @@ and Windows; one static binary per platform, built from one codebase.
   Release binaries ship `full`; optional slim per-engine builds are possible.
 - **OS-agnostic by construction:** the crate uses cross-platform std and portable crates
   (`std::path::PathBuf`, `available_parallelism`, native `tar`/`flate2`/`zstd`/`arrow` rather than
-  shelling out to `tar`/`gzip`), so archival and file backup have no OS-specific code path.
-- **The only OS-dependent edge is a Postgres *full logical* backup/restore** under the
-  `external` dump strategy, which needs `pg_dump`/`pg_restore` on `PATH` (see §5.1). Every other
-  path is pure Rust: Mongo and MySQL backup/restore use native backends, and all archival and
-  file operations need nothing external. Per-OS notes cover the Postgres case, and a native
-  Postgres dump is a roadmap item (§15) to close it.
+  shelling out to `tar`/`gzip`), and every database engine is driven in-process over its wire
+  protocol (§5.1). There is **no OS-dependent code path and no external tool on any path** —
+  backup, restore, verify, archive, and file operations need nothing beyond the binary.
+- **The container image is a `scratch`/distroless base plus the binary — and nothing else**: no
+  database client packages, no shell, no interpreter. Its size and attack surface are those of the
+  static binary alone.
 - **CI builds and tests on Linux, macOS, and Windows** on every change; the release workflow
   cross-builds the full target matrix on tags.
-- Container image: distroless/minimal base + the static binary; no interpreter, tiny image.
 - `cargo install arkstore --features …` for source installs.
 
 ---
@@ -656,8 +761,12 @@ and Windows; one static binary per platform, built from one codebase.
 7. **Typed config with precise errors** — serde-validated config that points at the bad field.
 8. **Deterministic, testable core** — inject clock/object-store/DB behind traits; fast unit tests
    without live infra.
-9. **Roadmap: client-side encryption**, PITR-adjacent options, and a `verify` operation that
-   round-trips a backup (restore into a throwaway target and diff).
+9. **No database client tools, anywhere** — every engine is spoken to over its wire protocol from
+   inside the binary (§5.1); nothing to install, version-match, or ship in an image, and
+   credentials never leave process memory.
+10. **Verification is built in** — the `verify` operation (§6.5) round-trips a backup into a
+    throwaway target and diffs it against the manifest baseline, so fidelity is proven, not assumed.
+11. **Roadmap: client-side encryption**, PITR-adjacent options, additional object stores.
 
 ---
 
@@ -698,11 +807,14 @@ These are deliberate choices baked into the requirements above. They are recorde
    in the bucket, so backups from sources later removed from config are still pruned. Rationale:
    the bucket is the source of truth for what exists; config drift must not orphan storage forever.
 
-7. **Native wire-protocol drivers, external tools only where fidelity demands it.** Backup/restore
-   prefer the engine's native Rust driver (the wire protocol *is* the API — §5.1), falling back to
-   an external client tool only where nothing in pure Rust matches its fidelity (Postgres full
-   logical schema). Rationale: fewer host prerequisites, no version-matching of client tools, and
-   streaming binary bulk paths — without ever trading away restore fidelity.
+7. **Native wire-protocol drivers for everything; no client tools.** Backup, restore, and archive
+   for every engine go through a pure-Rust driver speaking the wire protocol, compiled into the
+   binary (§5.1). `pg_dump`/`mysqldump`/`mongodump` are themselves only wire-protocol clients, so
+   nothing they do is out of reach; what they *guarantee* — a consistent snapshot and a defined
+   fidelity scope — is written into the requirements (§5.1.1, §5.1.2) and proven by `verify` (§6.5)
+   instead of being inherited by shelling out. Rationale: zero host prerequisites, no
+   version-matching of client tools, credentials that never leave process memory, one code path
+   per engine, and a container image that is just the binary.
 
 8. **Engine selection is compile-time, not runtime.** Engines are Cargo features producing one
    self-contained artifact (§5); using an engine not built in fails fast with a rebuild message.
@@ -721,6 +833,20 @@ These are deliberate choices baked into the requirements above. They are recorde
     real deployments need "keep the shape of this table but not its (huge/sensitive/transient) rows"
     without losing the schema — a single exclude list can't express that.
 
+11. **One consistent snapshot per source.** A backup reads every object of a source at a single
+    transactional point in time (`REPEATABLE READ` + `pg_export_snapshot()` / `WITH CONSISTENT
+    SNAPSHOT` — §5.1.1), and a dump that cannot establish its snapshot fails before reading
+    anything. Rationale: a set of per-table reads taken at different moments is not a backup of the
+    database — it is a collection of mutually inconsistent tables that may violate every foreign
+    key on restore. Consistency is the property that makes a dump restorable, so it is a hard
+    requirement, not an optimization.
+
+12. **Fidelity is a contract, verified.** "Full fidelity" is an enumerated object list per engine
+    (§5.1.2); unsupported objects are logged rather than silently dropped; and the `verify`
+    operation (§6.5) round-trips real backups in CI and on demand. Rationale: a native dump's
+    correctness must be demonstrable — the enumerated contract is what "done" means, and the
+    round-trip is what checks it.
+
 ---
 
 ## 14. Non-Functional Requirements
@@ -729,7 +855,10 @@ These are deliberate choices baked into the requirements above. They are recorde
 - **Performance:** parallel sources; streaming I/O; bounded memory independent of dataset size;
   cheap dry-runs (metadata/count only).
 - **Portability:** static binaries for major platforms; S3-compatible endpoints.
-- **Reliability:** idempotent archive; per-item isolation; validated cleanup plans.
+- **Reliability:** idempotent archive; per-item isolation; validated cleanup plans; one consistent
+  snapshot per backup (§5.1.1).
+- **Fidelity:** every engine backend satisfies its enumerated fidelity contract (§5.1.2), proven by
+  `verify` round-trips against containerized databases in CI.
 - **Testability:** ≥80% coverage target; trait-injected dependencies; integration tests against
   containerized DBs + MinIO.
 - **Documentation:** per-operation docs, config reference, lifecycle guidance, migration notes.
@@ -738,16 +867,17 @@ These are deliberate choices baked into the requirements above. They are recorde
 
 ## 15. Milestones / Roadmap
 
-- **M0 — Skeleton:** CLI, config/secrets loading, object-store abstraction, logging, dry-run
-  plumbing, one engine (Postgres) backup + restore.
+- **M0 — Skeleton + first native engine:** CLI, config/secrets loading, object-store abstraction,
+  logging, dry-run plumbing; **PostgreSQL backup + restore fully native** (snapshot §5.1.1,
+  catalog-driven schema dump, `COPY` data, manifest with dependency graph); a first `verify`
+  round-trip (§6.5) gating the fidelity contract in CI.
 - **M1 — Cleanup:** full retention model, plan/execute/consolidate, audit trail, validation.
 - **M2 — Archive:** Postgres archive engine, Parquet writer, whole-months policy, verify-before-delete.
-- **M3 — Multi-engine + native backends:** MySQL + Mongo backup/restore/archive via **native
-  Rust** backends (no external tools), file sources; Postgres data via native `COPY` with
-  `pg_dump`/`pg_restore` for full schema (§5.1); the `dump_strategy` config knob.
-- **M4 — Distribution:** prebuilt releases, container image, docs site, `verify` operation.
-- **M5 — Extensions:** native Postgres logical dump (retire the `pg_dump` dependency),
-  client-side encryption, additional object stores (GCS/Azure).
+- **M3 — Multi-engine:** MySQL/MariaDB and MongoDB backup/restore/archive via their native
+  backends (§5.1); file sources; `verify` extended to each engine.
+- **M4 — Distribution:** prebuilt releases, container image (binary only), docs site.
+- **M5 — Extensions:** client-side encryption; additional object stores (GCS/Azure); oplog-based
+  point-in-time consistency for MongoDB; Postgres large objects.
 
 ---
 
@@ -755,13 +885,16 @@ These are deliberate choices baked into the requirements above. They are recorde
 
 1. Default feature set for the primary release build — `postgres,archive,files` only, or `full`?
 2. Config format — stay YAML, or offer TOML (more idiomatic in Rust) too?
-3. Is a `verify` (round-trip restore) operation in scope for v1 or roadmap?
-4. Minimum supported object stores for v1 (AWS S3 + MinIO only, or GCS/Azure day one)?
-5. Native Postgres logical dump — is matching `pg_dump` fidelity (extensions, custom types,
-   partitioning, privileges) worth the effort/risk, or is `external` the permanent answer for
-   Postgres full backups?
+3. Minimum supported object stores for v1 (AWS S3 + MinIO only, or GCS/Azure day one)?
+4. Postgres binary `COPY` — keep as opt-in only, or auto-select when source and target server
+   versions and architectures match?
+5. `tokio-postgres` vs `sqlx` as the Postgres driver (both pure Rust, both support `COPY`) — the
+   choice decides whether one driver stack (`sqlx`) can serve Postgres and MySQL together.
 
 **Resolved (now specified above):**
+- *Dump mechanism* — fully native wire-protocol backends for every engine; no external client
+  tools and no `dump_strategy` knob (§5.1, §13.7). No longer open.
+- *`verify` operation* — in scope as a core operation from M0 (§6.5). No longer open.
 - *Restore target model* — a dedicated optional `targets` layer, overridable inline and by
   CLI/env with per-field precedence (§6.2, §7). No longer open.
 - *Calendar timezone* — all calendar math (cleanup banding + archive cutoff) uses `app.timezone`
