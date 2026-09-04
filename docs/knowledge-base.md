@@ -415,7 +415,10 @@ Three declarative layers (PRD §7). See [`arkstore.example.yaml`](../arkstore.ex
 
 ### 6.1 Global policy (`arkstore.yaml`)
 
-- `app` — `name`, `timezone` (drives **all** calendar math — §3, §4), log level.
+- `app` — `name`, `timezone` (drives **all** calendar math — §3, §4), log level,
+  `local_dir` (where local copies of finished backups live, mirroring the S3
+  layout `<local_dir>/<source>/versioned/…` + `<source>.latest.tar.gz`; scratch
+  work uses temp dirs). Default `arkstore-local`.
 - `logger` — handler toggles: `console` (default), `file` (rotating; time-based,
   e.g. rotate at midnight, keep N files), `error-reporting` (Sentry-style, off),
   `collector` (JSON/Loki/Alloy shipping, off). Endpoints may arrive via the secret.
