@@ -202,17 +202,21 @@ or a single named source via `--source <name>`.
    (`backup_to_s3: false`).
 7. **Local artifact lifecycle** — the per-source working directory is always removed; local
    copies of the finished archive are removed only when `delete_after_upload` is true *and* the
-   upload verified. When kept, **`local_retention: N`** prunes to the newest `N` versioned
-   archives per source (0 = unlimited / disabled); the `latest` pointer is always kept.
+   upload verified. When copies are kept, **`local_retention: N`** bounds them: with `N ≥ 1` it
+   prunes to the newest `N` **versioned** archives per source (oldest deleted first); **`N = 0`
+   disables pruning entirely and retains all versioned archives.** The `latest` pointer is always
+   kept and is **never counted** toward `N`.
 
 **Ignore rules (per source):**
 
 - **`ignore_startswith`** — object-name prefixes excluded **outright** (no structure, no data).
   Intended for engine/system objects (e.g. Postgres `pg_`, `rds_`, `awsdms_`; Mongo `system.`,
   `local.`).
-- **`ignore`** — named objects whose **data** is skipped but whose **structure is still captured**
-  (the object is recreated empty on restore). Engines without this distinction (see §5.1) treat
-  `ignore` as an outright exclusion too; the split behaviour is documented per engine.
+- **`ignore`** — behaviour is per engine:
+  - **PostgreSQL** — the object's **data is skipped but its structure is still captured** (recreated
+    empty on restore). This data-skip semantic is Postgres-only.
+  - **MySQL/MariaDB, MongoDB, and file sources** — `ignore` is an **outright exclusion** (no
+    structure, no data), the same as `ignore_startswith`.
 
 **Per-file-source pipeline:** tar + compress the configured `path` tree and upload the same way.
 File sources honour `ignore` / `ignore_startswith` (fnmatch on the entry basename) and
@@ -245,19 +249,27 @@ from the original (a staging DB, a different host/database, a different director
 `--source` at a time — it never iterates all sources — and is the most correctness-sensitive
 operation, so it is preview-first, target-guarded, and integrity-checked throughout.
 
-**Sub-actions (`--action`):**
+**Sub-actions (positional, consistent with `cleanup`):**
 
-- **`restore`** (default) — the full restore flow below.
+- **`restore`** (default when no action is given) — the full restore flow below.
 - **`list-backups`** — list the versioned backups available for the source (key, size,
   last-modified), newest first. Reads only; writes nothing.
 
-**Target model:**
+(The action is a positional value — `arkstore restore list-backups` — matching the `cleanup`
+sub-action style, not a `--action` flag.)
 
-- The target is resolved with precedence **CLI flag > environment variable > config**, per field
-  (`--target-host` / `--target-port` / `--target-db` / `--target-user` / `--target-path`, their
-  env equivalents, then a named entry in the `targets` config, else an inline `restore.target`).
-  Ports default per engine (Postgres 5432 / MySQL 3306 / Mongo 27017); Mongo `auth_db` defaults to
-  the target db.
+**Target model** — resolved in two stages:
+
+1. **Which target entry** — pick the named entry from the `targets` config by
+   **`--target <name>` > env `ARKSTORE_TARGET` > the source's own name** (i.e. by default a source
+   restores to the target sharing its name); if no `targets` entry matches, fall back to an inline
+   `restore.target` block. Restoring with no resolvable target is an error.
+2. **Per-field overrides on top** — each connection field is then resolved with precedence
+   **CLI flag > env var > the chosen target entry > engine default**:
+   `--target-host` / `--target-port` / `--target-db` / `--target-user` / `--target-path` (and env
+   equivalents). Ports default per engine (Postgres 5432 / MySQL 3306 / Mongo 27017); Mongo
+   `auth_db` defaults to the target db.
+
 - The **target password is never taken from the command line** — environment variable, config, or
   an interactive `getpass` prompt on a TTY only (see §8, §9.6).
 
@@ -280,16 +292,22 @@ operation, so it is preview-first, target-guarded, and integrity-checked through
 3. **Prove the target is empty before downloading or extracting** (a non-empty target aborts
    early, before any transfer), unless it is a local single-dump restore.
 4. Resolve `--from`, download, and **safely extract** the archive (see §8 extraction hardening).
-5. **Validate the archive against its `manifest.json`** — verify each expected file is present and
-   matches its recorded `sha256`/size. A missing/corrupt *data* file drops that object and counts
-   as a failure. A missing/mismatched *structure* file is non-fatal **only when the object's schema
-   is otherwise available** — i.e. the data file is self-describing (carries its own DDL, as a full
-   per-table dump does) *or* the target already defines the object; in that case the restorer falls
-   back to deriving FK order (step 6) from the data file. If neither holds — a genuinely
-   **data-only** object whose target has no matching schema and whose data file carries no DDL —
-   the object **fails** (recorded, skipped) rather than loading partial or unusable data. The
-   never-silently-incomplete rule wins: an object is only "restored" if its schema exists or is
-   created.
+5. **Validate the archive against its `manifest.json`.** The manifest is the authority on **which
+   files each object is expected to have** — so "missing" always means *missing relative to what the
+   manifest records*, never "a file some other object type would have." For each object the manifest
+   lists, verify its recorded files are present and match their `sha256`/size:
+   - A **data file the manifest records** that is missing or corrupt ⇒ the object **fails**
+     (recorded, skipped). An object the manifest records as **structure-only** (or data-skipped,
+     §6.1) legitimately has **no** data file — that is expected, not a failure; it is recreated
+     empty (§6.2 structure-only).
+   - A **structure file the manifest records** that is missing/mismatched is non-fatal **only when
+     the object's schema is otherwise available** — the data file is self-describing (carries its
+     own DDL, as a full per-table dump does) *or* the target already defines the object; the
+     restorer then falls back to deriving FK order (step 6) from the data file. Otherwise — a
+     genuinely **data-only** object whose target has no matching schema and whose data file carries
+     no DDL — the object **fails** rather than loading partial/unusable data.
+   The never-silently-incomplete rule wins: an object is "restored" only if the files the manifest
+   promised are intact and its schema exists or is created.
 6. **Compute load order** — parse foreign-key relationships and topologically **layer** the
    objects so parents load before children (Mongo is a single layer). Cyclic dependencies are
    handled by loading the tables with **foreign-key application deferred**, then applying the
@@ -427,7 +445,10 @@ Requirements:
 - Strongly typed deserialization (serde) with **clear validation errors** naming the offending
   field/source, not a stack trace.
 - **Source names must be a safe single path segment** (they become S3 key components and local
-  directory names) — validated against a strict charset; anything else is rejected up front.
+  directory names). The grammar is `^[A-Za-z0-9][A-Za-z0-9_.-]*$` — it must start with a letter or
+  digit, then contain only letters, digits, underscore (`_`), dot (`.`), or hyphen (`-`). No path
+  separators (`/`, `\`), no `..`, no whitespace, no leading punctuation, non-empty. Anything else is
+  rejected up front with an error naming the offending source.
 - Sensible defaults so a minimal config works; every default documented (see the KB for the full
   default table).
 - Config file locations discoverable via flag / env / conventional path.
@@ -562,6 +583,7 @@ whose contents originate outside the tool), so the following are hard requiremen
 arkstore backup   [--type <engine>] [--source <name>] [--dry-run] [--config <path>]
 arkstore restore  [restore | list-backups]
                   [--source <name>] [--from <stamp|key|latest>]
+                  [--target <name>]
                   [--target-host <h>] [--target-port <p>] [--target-db <d>]
                   [--target-user <u>] [--target-path <path>] [--dry-run]
 arkstore cleanup  [generate-plan | execute-plan <plan> | run | consolidate-plans]
@@ -574,9 +596,10 @@ Global: --config, --log-level, --timezone, --version, --help
 - Subcommand-per-operation (clap-derive), consistent flags across operations.
 - `--dry-run` and `--source` available wherever they make sense; `--type` narrows `backup` to one
   engine type.
-- Restore takes an **action** (`restore` default, `list-backups`), a `--from` selector, and
-  per-field **target overrides** (which beat env, which beat config — §6.2). The target password is
-  never a flag (§8).
+- Restore takes a **positional action** (`restore` default, `list-backups` — same style as
+  `cleanup`), a `--from` selector, a `--target <name>` entry selector (defaults to the source's
+  name), and per-field **target overrides** (each: flag > env > chosen entry > default — §6.2). The
+  target password is never a flag (§8).
 - `arkstore --version` prints version **and the engines compiled in**.
 
 ---

@@ -67,8 +67,10 @@ Per enabled source (narrowable to one engine type via `--type`, or one source vi
    declaring success. `backup_to_s3: false` keeps the backup local only.
 7. **Local lifecycle** — always remove the per-source working dir; remove the
    local finished archive only when `delete_after_upload` *and* the upload
-   verified. Otherwise **`local_retention: N`** keeps the newest `N` versioned
-   archives per source (`0` = disabled); the `latest` pointer is always kept.
+   verified. Otherwise **`local_retention: N`** bounds kept copies: `N ≥ 1` keeps
+   the newest `N` **versioned** archives per source (oldest deleted first);
+   **`N = 0` disables pruning and retains all versioned archives.** The `latest`
+   pointer is always kept and **never counted** toward `N`.
 
 ### 2.2 File source
 
@@ -82,9 +84,11 @@ Per enabled source (narrowable to one engine type via `--type`, or one source vi
 - **`ignore_startswith`** — object-name prefixes excluded **outright** (no
   structure, no data). Typical defaults: Postgres `pg_` / `rds_` / `awsdms_`;
   Mongo `system.` / `local.`.
-- **`ignore`** — named objects whose **data is skipped but structure is kept**
-  (recreated empty on restore, §5.6). Engines without the split (MySQL, Mongo,
-  file) treat `ignore` as an outright exclusion too.
+- **`ignore`** — per engine:
+  - **PostgreSQL** — **data skipped, structure kept** (recreated empty on restore,
+    §5.7). This data-skip semantic is Postgres-only.
+  - **MySQL/MariaDB, MongoDB, file sources** — **outright exclusion** (no structure,
+    no data), same as `ignore_startswith`.
 
 ### 2.4 Invariants
 
@@ -229,19 +233,23 @@ correctness-sensitive operation: preview-first, target-guarded, integrity-checke
 
 ### 5.1 Actions & selection
 
-- **`restore`** (default) — the full flow below.
-- **`list-backups`** — list versioned backups for the source (key / size /
-  last-modified), newest first; reads only.
+- Action is a **positional** value (like `cleanup`), not a `--action` flag:
+  - **`restore`** (default when omitted) — the full flow below.
+  - **`list-backups`** — list versioned backups for the source (key / size /
+    last-modified), newest first; reads only.
 - **`--from`** selects the backup: `latest` (default), a specific stamp/key, or a
   local dump/archive path (offline / single-item).
 
-### 5.2 Target resolution
+### 5.2 Target resolution (two stages)
 
-- Per field, precedence is **CLI flag > env var > config**:
-  `--target-host/-port/-db/-user/-path`, then env, then a named entry in
-  `targets` (or inline `restore.target`).
-- Ports default per engine (5432 / 3306 / 27017); Mongo `auth_db` defaults to the
-  target db.
+1. **Which target entry** — chosen by **`--target <name>` > env `ARKSTORE_TARGET`
+   > the source's own name** (a source restores by default to the target sharing
+   its name); if no `targets` entry matches, fall back to inline `restore.target`.
+   No resolvable target ⇒ error.
+2. **Per-field overrides** — each field then resolves **CLI flag > env var > chosen
+   target entry > engine default**: `--target-host/-port/-db/-user/-path`. Ports
+   default per engine (5432 / 3306 / 27017); Mongo `auth_db` defaults to the target
+   db.
 - **Password never comes from argv** — env / config / interactive `getpass` on a
   TTY only (§6, §8).
 
@@ -258,15 +266,20 @@ correctness-sensitive operation: preview-first, target-guarded, integrity-checke
 3. **Prove the target is empty before download/extract** (non-empty ⇒ abort early,
    before any transfer) — except a local single-dump restore.
 4. Resolve `--from` → download → **safe-extract** (§8/PRD §9.6).
-5. **Validate against `manifest.json`** — each expected file present, `sha256`/size
-   match. A missing/corrupt **data** file drops that object and counts as a
-   failure. A missing/mismatched **structure** file is non-fatal **only when the
-   schema is otherwise available** — the data file is self-describing (carries its
-   own DDL, as a full per-table dump does) *or* the target already defines the
-   object; then the restorer falls back to deriving FK order (§5.5) from the data
-   file. A genuinely **data-only** object with no schema in the target and no DDL
-   in the data file **fails** (recorded, skipped) — never load data into a
-   non-existent table. (See the data-only note in §5.7.)
+5. **Validate against `manifest.json`.** The manifest is the authority on **which
+   files each object should have** — "missing" means missing *relative to the
+   manifest*, not "a file another object type would carry":
+   - A **data file the manifest records** that is missing/corrupt ⇒ the object
+     **fails**. An object the manifest records as **structure-only** (or
+     data-skipped, §2.3) legitimately has **no** data file — expected, not a
+     failure; recreated empty (§5.7).
+   - A **structure file the manifest records** that is missing/mismatched is
+     non-fatal **only when the schema is otherwise available** — the data file is
+     self-describing (own DDL, as a full per-table dump has) *or* the target
+     already defines the object; then fall back to deriving FK order (§5.5) from
+     the data file. Otherwise a genuinely **data-only** object with no target
+     schema and no DDL **fails** — never load data into a non-existent table
+     (§5.7).
 6. **Compute load order** (§5.5).
 7. **Load** per layer, then verify object presence. Per-object failure isolation:
    a failed object is recorded + skipped, never aborting the run.
@@ -357,8 +370,10 @@ defaults:
 | `path` | file | — (required) |
 | `authentication_database` | mongo | source `name` |
 
-**Source `name`** must be a safe single path segment (strict charset) — it becomes
-an S3 key component and a local dir name.
+**Source `name`** must be a safe single path segment — it becomes an S3 key
+component and a local dir name. Grammar: `^[A-Za-z0-9][A-Za-z0-9_.-]*$` (starts
+with a letter/digit; then letters, digits, `_`, `.`, `-` only; no `/`/`\`, no
+`..`, no whitespace; non-empty). Anything else is rejected up front.
 
 ### 6.3 Targets (`targets.yaml`, optional)
 
