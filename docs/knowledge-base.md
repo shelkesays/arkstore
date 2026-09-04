@@ -5,6 +5,12 @@ invariants, and on-disk/S3 formats that the implementation must honor. This is
 the reference to consult when implementing an operation; the PRD says *what*, this
 says *exactly how*.
 
+> **Implementation status:** like the PRD, this is a **specification ahead of
+> implementation** (roadmap: [PRD §15](../PRD.md)). Present-tense wording states
+> *required* behavior; a documented action, flag, or config field may not yet be
+> wired into the binary — that is expected at the current M0 skeleton stage, not a
+> defect.
+
 ---
 
 ## 1. S3 key layouts

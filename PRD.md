@@ -10,6 +10,15 @@
 - **License:** MIT
 - **Language:** Rust (no `unsafe` in the crate; `#![forbid(unsafe_code)]`)
 
+> **Implementation status — read this first.** This document is a **specification that leads
+> implementation**: it defines the target behavior, CLI contract, and config model the binary is
+> being built to satisfy. The crate is currently at the **M0 skeleton** stage (see the roadmap,
+> §15) — the architecture and command surface exist, but most operation internals are stubs.
+> **Present-tense wording in the sections below states *required* behavior, not a claim that it
+> already ships.** Any flag, sub-action, or config field described here that is not yet wired into
+> the binary is expected and intentional — it is the contract, not a bug. Do not read a section as
+> a description of the current build.
+
 ---
 
 ## 1. Overview & Vision
