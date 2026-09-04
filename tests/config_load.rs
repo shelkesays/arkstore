@@ -189,3 +189,48 @@ targets:
         "Debug must not leak secrets"
     );
 }
+
+#[test]
+fn secrets_can_supply_required_fields_when_validation_runs_after_hydration() {
+    // `host` lives only in the secrets file. `load` (validate immediately)
+    // must reject it; `load_unvalidated` -> secrets -> `validate` (what main does) must
+    // accept it.
+    let yaml = format!("{BASE}sources:\n  - {{name: appdb, type: postgre, user: u}}\n");
+    let secrets = "sources:\n  appdb: {password: pw, host: db.internal}\n";
+    let dir = tempfile::tempdir().unwrap();
+    write_file(dir.path(), "arkstore.yaml", &yaml).unwrap();
+    write_file(dir.path(), "secrets.yaml", secrets).unwrap();
+    let path = dir.path().join("arkstore.yaml");
+    assert!(Config::load(&path)
+        .unwrap_err()
+        .to_string()
+        .contains("`host`"));
+
+    let mut config = Config::load_unvalidated(&path).unwrap();
+    let env: HashMap<String, String> = [(
+        ENV_SECRETS_FILE.to_string(),
+        dir.path()
+            .join("secrets.yaml")
+            .to_string_lossy()
+            .into_owned(),
+    )]
+    .into();
+    load_secrets(&mut config, &env).unwrap();
+    config.validate().unwrap();
+    assert_eq!(
+        config.source("appdb").unwrap().host.as_deref(),
+        Some("db.internal")
+    );
+}
+
+#[test]
+fn timezone_override_is_applied_before_validation() {
+    let bad_tz = BASE.replace("Europe/Berlin", "Mars/Olympus");
+    let dir = tempfile::tempdir().unwrap();
+    write_file(dir.path(), "arkstore.yaml", &bad_tz).unwrap();
+    let path = dir.path().join("arkstore.yaml");
+    assert!(Config::load(&path).is_err());
+    let mut config = Config::load_unvalidated(&path).unwrap();
+    config.app.timezone = "UTC".into();
+    config.validate().unwrap();
+}

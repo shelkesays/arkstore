@@ -44,12 +44,15 @@ async fn main() -> ExitCode {
 /// Load config + secrets and dispatch. Returns the names of items that
 /// failed so `main` can pick the exit code.
 async fn run(cli: &Cli) -> arkstore::Result<Vec<String>> {
-    let mut config = Config::load(&cli.config)?;
+    // Read -> CLI overrides -> secrets -> validate, so a host/user that lives
+    // only in the secrets file, or a --timezone override, is in place before
+    // anything is checked.
+    let mut config = Config::load_unvalidated(&cli.config)?;
     if let Some(tz) = &cli.timezone {
         config.app.timezone = tz.clone();
-        config.timezone()?;
     }
     secrets::load_secrets(&mut config, &ProcessEnv)?;
+    config.validate()?;
 
     match &cli.command {
         Command::Backup {
