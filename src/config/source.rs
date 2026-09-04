@@ -139,14 +139,14 @@ pub struct Source {
     pub ignore_extensions: Option<Vec<String>>,
     /// Emit ownership / privileges in DDL (Postgres, MySQL). Default: false.
     #[serde(default)]
-    pub include_privileges: bool,
+    pub include_privileges: Option<bool>,
     /// Postgres data encoding. Default: text.
     #[serde(default)]
-    pub copy_format: CopyFormat,
+    pub copy_format: Option<CopyFormat>,
     /// MySQL: dump non-transactional tables outside the snapshot instead of
     /// failing the source. Default: false.
     #[serde(default)]
-    pub allow_unsnapshotted_tables: bool,
+    pub allow_unsnapshotted_tables: Option<bool>,
 
     // ---- where it goes ----
     #[serde(default = "default_true")]
@@ -182,6 +182,25 @@ impl Source {
     /// Effective port: explicit, else the engine default.
     pub fn port(&self) -> u16 {
         self.port.unwrap_or(self.source_type.default_port())
+    }
+
+    /// Emit ownership / privileges in DDL: explicit, else `false`. Stored as
+    /// `Option` (like `copy_format` / `allow_unsnapshotted_tables`) so an
+    /// explicit value on an engine it does not apply to is rejected, whatever
+    /// the value.
+    pub fn effective_include_privileges(&self) -> bool {
+        self.include_privileges.unwrap_or(false)
+    }
+
+    /// Postgres data encoding: explicit, else text.
+    pub fn effective_copy_format(&self) -> CopyFormat {
+        self.copy_format.unwrap_or_default()
+    }
+
+    /// MySQL: dump non-transactional tables outside the snapshot: explicit,
+    /// else `false` (fail the source).
+    pub fn effective_allow_unsnapshotted_tables(&self) -> bool {
+        self.allow_unsnapshotted_tables.unwrap_or(false)
     }
 
     /// Whether structure (DDL) is dumped: explicit, else engine default.
@@ -272,19 +291,19 @@ impl Source {
         let misuse = [
             (
                 "copy_format",
-                self.copy_format == CopyFormat::Binary,
+                self.copy_format.is_some(),
                 matches!(ty, SourceType::Postgre),
                 "postgre",
             ),
             (
                 "allow_unsnapshotted_tables",
-                self.allow_unsnapshotted_tables,
+                self.allow_unsnapshotted_tables.is_some(),
                 matches!(ty, SourceType::Mysql),
                 "mysql",
             ),
             (
                 "include_privileges",
-                self.include_privileges,
+                self.include_privileges.is_some(),
                 matches!(ty, SourceType::Postgre | SourceType::Mysql),
                 "postgre/mysql",
             ),
