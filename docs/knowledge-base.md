@@ -50,22 +50,29 @@ Per enabled source (narrowable to one engine type via `--type`, or one source vi
 
 ### 2.1 Database source
 
-1. **Enumerate objects** (tables / collections) from the live source; apply the
-   source's ignore rules (§2.3).
-2. **Dump each object** per the source's `dump_strategy` (§8) and its
-   `structure` / `data` toggles:
-   - `structure: true` → dump the object's DDL/definition.
-   - `data: true` → dump the object's rows/documents.
+1. **Open the snapshot** — one consistent, read-only snapshot for the whole
+   source (§11.1). Cannot establish it ⇒ the source fails before reading anything.
+2. **Enumerate objects** (tables / collections) from the catalogs inside that
+   snapshot; apply the source's ignore rules (§2.3).
+3. **Dump each object** through the engine's native wire-protocol backend (§11),
+   inside the snapshot, per its `structure` / `data` toggles:
+   - `structure: true` → dump the object's DDL/definition (`<obj>.schema.sql` /
+     `metadata.json`).
+   - `data: true` → dump the object's rows/documents (`<obj>.data.copy` /
+     `.data.tsv` / `.bson` — §11.3).
    A source may be structure-only, data-only, or both.
-3. **Completeness gate** — if *any* object fails to dump, **abort the source and
+4. **Completeness gate** — if *any* object fails to dump, **abort the source and
    upload nothing**. A partial archive is never produced.
-4. **Write `manifest.json`** at the archive root (database sources): format
-   version, source name, engine type, `created_at`, and one entry per file
-   `{path, object_name, size, sha256}`.
-5. **Package** — tar + stream through gzip to `versioned/<source>.<stamp>.tar.gz`.
-6. **Upload** (when `backup_to_s3`), then **verify** (size / checksum) before
+5. **Write `manifest.json`** at the archive root (database sources): format
+   version, source name, engine type + server version, snapshot identity,
+   `created_at`; one entry per file `{path, object_name, kind, size, sha256}`; and
+   per object its **dependency graph** (FK parents, view deps), **row/document
+   count**, and (SQL) an order-independent **content hash** — the baseline for
+   restore ordering (§5.5) and `verify` (§12).
+6. **Package** — tar + stream through gzip to `versioned/<source>.<stamp>.tar.gz`.
+7. **Upload** (when `backup_to_s3`), then **verify** (size / checksum) before
    declaring success. `backup_to_s3: false` keeps the backup local only.
-7. **Local lifecycle** — always remove the per-source working dir; remove the
+8. **Local lifecycle** — always remove the per-source working dir; remove the
    local finished archive only when `delete_after_upload` *and* the upload
    verified. Otherwise **`local_retention: N`** bounds kept copies: `N ≥ 1` keeps
    the newest `N` **versioned** archives per source (oldest deleted first);
@@ -92,8 +99,9 @@ Per enabled source (narrowable to one engine type via `--type`, or one source vi
 
 ### 2.4 Invariants
 
-- Per-source **failure isolation**: a bad source (creds, missing tool, upload
-  error) is logged + recorded; the run continues to the next source.
+- Per-source **failure isolation**: a bad source (creds, unreachable host,
+  snapshot failure, upload error) is logged + recorded; the run continues to the
+  next source.
 - An empty / no-match selection is a clean warning, not an error.
 - Exit `1` if any source failed, else `0`.
 - The `latest` pointer is the only mutable object (§Design decision 4, PRD §13).
@@ -274,12 +282,10 @@ correctness-sensitive operation: preview-first, target-guarded, integrity-checke
      data-skipped, §2.3) legitimately has **no** data file — expected, not a
      failure; recreated empty (§5.7).
    - A **structure file the manifest records** that is missing/mismatched is
-     non-fatal **only when the schema is otherwise available** — the data file is
-     self-describing (own DDL, as a full per-table dump has) *or* the target
-     already defines the object; then fall back to deriving FK order (§5.5) from
-     the data file. Otherwise a genuinely **data-only** object with no target
-     schema and no DDL **fails** — never load data into a non-existent table
-     (§5.7).
+     non-fatal **only when the target already defines the object** (rows load
+     into the existing schema). Native data files carry **no DDL** (§11.3), so
+     there is no "self-describing data file" fallback: target lacks the object ⇒
+     **fail** — never load data into a non-existent table (§5.7).
 6. **Compute load order** (§5.5).
 7. **Load** per layer, then verify object presence. Per-object failure isolation:
    a failed object is recorded + skipped, never aborting the run.
@@ -287,24 +293,30 @@ correctness-sensitive operation: preview-first, target-guarded, integrity-checke
 
 ### 5.5 Foreign-key ordering
 
-- Parse FK relationships (`FOREIGN KEY … REFERENCES <parent>`) **COPY-block-aware**,
-  and topologically **layer** objects so parents load before children. Mongo is a
-  single layer (no FKs).
-- **Cycles**: load the tables with FK **application deferred**, then apply the
-  deferred constraints in a final pass.
+- Load order comes from the **dependency graph recorded in the manifest** (read
+  from the catalogs at dump time — `pg_constraint` / `information_schema` — never
+  by parsing SQL text). Topologically **layer** objects so FK parents load before
+  children and views after their base relations. Mongo is a single layer.
+- **Cycles**: create the tables and load their data with FK constraints
+  **deferred**, then apply the deferred constraints in a final pass.
 
-### 5.6 SQL preprocessing (before load)
+### 5.6 Load mechanics (native)
 
-Makes dumps portable across servers/privilege levels — all **COPY-aware** so data
-blocks are untouched:
+No text-preprocessing step exists: Arkstore **emits the DDL it restores**, so
+portability is a property of the dump (§11.2) — ownership/privileges are not
+emitted unless `include_privileges` is on, FK constraints are emitted separately
+so they can be deferred (§5.5), and no server-version-specific statements are
+ever written.
 
-- strip `ALTER … OWNER TO` and `GRANT` / `REVOKE`;
-- drop statements a target server can't accept (e.g. a newer server's
-  `SET transaction_timeout`);
-- defer `ADD CONSTRAINT … FOREIGN KEY` (feeds the cycle handling in §5.5).
-
-**Retry-with-fallback:** if a permission error blocks disabling constraint triggers
-(`session_replication_role = replica`), retry the load once without it.
+- **PostgreSQL** — apply `schema.sql` over the driver; stream `data.copy` with
+  `COPY … FROM STDIN`; set sequence values last. Attempt
+  `SET session_replication_role = replica` for speed / cycle tolerance, with
+  **retry-with-fallback**: on a permission error, retry the load once without it.
+- **MySQL/MariaDB** — apply DDL; load `data.tsv` as **batched multi-row `INSERT`**
+  under `FOREIGN_KEY_CHECKS=0, UNIQUE_CHECKS=0` (restored after). Never
+  `LOAD DATA LOCAL INFILE` (needs server-side opt-in).
+- **MongoDB** — create the collection with its recorded options, `insertMany`
+  batches, then `createIndexes` from `metadata.json`.
 
 ### 5.7 Structure-only, data-only & single-item restore
 
@@ -316,9 +328,10 @@ blocks are untouched:
   prior structure restore / migration). Restoring data-only into a target that
   lacks the object **fails that object** (§5.4 step 5) — the loader never
   fabricates a schema or writes rows to a non-existent table.
-- **Single-item** — a local single dump (`.sql` / engine archive) restores on its
-  own; the target object must be **absent or empty** first. (Single-item **file**
-  restore is unsupported — file restores use the full-tree path.)
+- **Single-item** — one object's Arkstore-produced dump (structure and/or data
+  file + manifest) restores on its own; the target object must be **absent or
+  empty** first; no dependency ordering applies to a single object. (Single-item
+  **file** restore is unsupported — file restores use the full-tree path.)
 
 ### 5.8 File restore
 
@@ -365,7 +378,7 @@ defaults:
 | `backup_to_s3` | all | `true` |
 | `delete_after_upload` | all | `true` |
 | `local_retention` | all | `0` (disabled) |
-| `dump_strategy` | DB | `auto` (§8, PRD §5.1) |
+| `include_privileges` | postgre/mysql | `false` (§11.2) |
 | `archive` | DB | `[]` (rules `{table, time_column, retention_days?}`) |
 | `path` | file | — (required) |
 | `authentication_database` | mongo | source `name` |
@@ -394,9 +407,11 @@ targets may be inline (`restore.target`) or fully overridden by CLI/env (§5.2).
   secrets manager (AWS Secrets Manager first) or a local secrets file, keyed by
   source/target name. The secret payload may also carry logging/observability
   config, so prod can route logs centrally while local runs print to console.
-- **Never log secret values.** DB passwords never reach argv — the client tool's
-  env var (`PGPASSWORD` / `MYSQL_PWD`) or a `0600` temp credentials file (Mongo),
-  removed after use. Restore target password may also come from a TTY prompt.
+- **Never log secret values.** There are no child processes (§11), so passwords
+  never touch argv, a child environment, or a temp file: they flow from the
+  secret store into the driver's in-memory connection config (zeroizing buffers)
+  and are dropped once connected. A restore target password may also come from a
+  TTY prompt — in-memory only.
 
 ---
 
@@ -476,10 +491,14 @@ requirements (PRD §9.6):
 - **Identifier validation** — table/collection names from untrusted dump/file
   names validated to a strict charset and safely quoted; no unvalidated
   interpolation.
-- **Error redaction** — on child-tool failure surface only the exit code + a safe
-  message, never argv/stdout/stderr (can carry secrets).
-- **Signals** — Ctrl-C aborts promptly, cleans temp dirs, exits `130`; an
-  interrupt during a child dump tool is surfaced as an interrupt, not a failure.
+- **Error redaction** — driver / object-store errors pass through Arkstore's own
+  error types with connection strings, credentialed hosts, and secret values
+  redacted before any log line, summary, or error-reporting sink; raw driver
+  error text is never echoed verbatim.
+- **Signals** — Ctrl-C cancels in-flight tasks cooperatively: open DB
+  transactions rolled back, in-progress uploads aborted (no dangling multipart
+  uploads), temp dirs removed, exit `130`. All work is in-process — no child to
+  reap.
 
 ---
 
@@ -512,8 +531,12 @@ optional delete (DB I/O). Cleanup is almost entirely list/delete network I/O.
 - **Bounded async tasks (tokio) + a semaphore** for source parallelism — not a
   thread or process per source. CPU-bound stages offload to a blocking/rayon pool
   sized to `cpu_workers`.
-- **No multiprocessing.** Crash isolation for the risky part is already free: dump
-  tools (`pg_dump`, …) run as child processes at that boundary.
+- **No multiprocessing, no child processes.** Every engine is driven in-process
+  over its wire protocol (§11). **Failure isolation is `Result`-based** — each
+  source task's errors are collected, never propagated as a crash. A **panic is
+  not isolable**: the release profile is `panic = "abort"`, so a panic ends the
+  run by design (fail-fast on a bug); hence SafeLint forbids `unwrap`/`expect`/
+  `panic!` outside tests — the invariant is "errors are values".
 - **The real limiter is the DB and object store**, not local hardware. Watch for:
   DB load from concurrent heavy dumps against one instance; object-store throttling
   (503 SlowDown) under many parallel uploads → retry with backoff; DB connection
@@ -542,11 +565,97 @@ OS-specific code path**.
 - Uses cross-platform std and portable crates: `std::path::PathBuf`,
   `available_parallelism`, and native `tar`/`flate2`/`zstd`/`arrow` rather than
   shelling out to `tar`/`gzip`.
-- The **only OS-dependent edge** is a Postgres *full logical* backup/restore under
-  the `external` dump strategy (`pg_dump`/`pg_restore` on `PATH`). Mongo and MySQL
-  backup/restore use native Rust backends, and all archival + file ops need nothing
-  external. See the dump-strategy design in [PRD §5.1](../PRD.md). A native Postgres
-  dump is a roadmap item to close even that edge.
+- **No OS-dependent edge and no external tool on any path.** Every engine is
+  driven in-process over its wire protocol (§11); backup, restore, verify,
+  archive, and file ops need nothing beyond the binary. TLS is `rustls` (no
+  OpenSSL), so the musl static build has no system-library dependency. The
+  container image is the binary alone.
 - Prebuilt release binaries: Linux `x86_64` (gnu + musl) + `aarch64`, macOS
   `aarch64` + `x86_64`, Windows `x86_64`. CI builds/tests on all three OSes; the
   release workflow cross-builds the matrix on version tags.
+
+---
+
+## 11. Native engine backends
+
+Every engine is driven over its **wire protocol** by a pure-Rust driver compiled
+into the binary (PRD §5.1). No client tool is ever invoked. `pg_dump`,
+`mysqldump`, and `mongodump` are themselves ordinary wire-protocol clients, so
+nothing they do is out of reach; what they guarantee — a consistent snapshot and
+a defined fidelity scope — is specified here instead of inherited.
+
+**Drivers:** Postgres `tokio-postgres` (or `sqlx` Postgres) — `COPY … TO STDOUT`
+/ `COPY … FROM STDIN`; MySQL `mysql_async` (or `sqlx` MySQL); Mongo the official
+`mongodb` crate + `bson`. TLS via `rustls`. All pure Rust, statically linkable.
+
+### 11.1 Snapshot consistency (required)
+
+| Engine | How | Parallel tables within a source |
+|---|---|---|
+| PostgreSQL | one `REPEATABLE READ` read-only transaction for the whole source; every catalog and table read inside it | `pg_export_snapshot()` on the leader; each worker connection runs `SET TRANSACTION SNAPSHOT '<id>'`, so all see one point in time |
+| MySQL/MariaDB | `START TRANSACTION WITH CONSISTENT SNAPSHOT` at `REPEATABLE READ` (InnoDB) | not shareable across connections — tables are dumped **sequentially on the snapshot connection**; parallelism stays at the source level (`max_sources`) |
+| MongoDB | single cursor per collection; **no cross-collection snapshot** without the oplog (stated in docs; oplog mode is roadmap) | — |
+
+Non-transactional MySQL engines (MyISAM) cannot be snapshotted → per-table
+warning. A source whose snapshot cannot be established **fails before any read**.
+
+### 11.2 Fidelity contract (what "full fidelity" means)
+
+- **PostgreSQL** — schemas; tables (columns, types, defaults, identity/serial,
+  generated columns, `NOT NULL`, collation); PK/unique/FK/check/exclusion
+  constraints; indexes (partial/expression included); sequences **and current
+  values**; views + materialized views (dependency-ordered); functions/procedures;
+  triggers; user-defined types (enum, composite, domain, range); extensions
+  (`CREATE EXTENSION`); comments; declarative partitioning (parent + partitions +
+  attachment); RLS policies when present. Ownership/privileges **opt-in**
+  (`include_privileges: false` default). **Out of scope v1:** large objects
+  (`pg_largeobject`), replication slots. Schema is read from `pg_catalog` using
+  `pg_get_viewdef` / `pg_get_functiondef` / `pg_get_indexdef` /
+  `pg_get_constraintdef` / `pg_get_triggerdef`; tables are assembled from
+  `pg_attribute` / `pg_type` / `pg_attrdef`.
+- **MySQL/MariaDB** — tables via `SHOW CREATE TABLE` (engine, charset/collation,
+  `AUTO_INCREMENT`, generated columns); views (dependency-ordered); triggers;
+  routines and events (`SHOW CREATE …`); foreign keys.
+- **MongoDB** — documents as BSON; indexes (`listIndexes`); collection options
+  (capped, validators, collation); views.
+
+Anything encountered outside the contract is **logged as unsupported**, never
+silently dropped; the completeness gate (§2.1) still applies to every listed
+object.
+
+### 11.3 Archive file formats
+
+| Engine | Structure | Data | Restore |
+|---|---|---|---|
+| PostgreSQL | `<obj>.schema.sql` (emitted DDL, portable by construction) | `<obj>.data.copy` — `COPY` **text** format, `\N` nulls (binary `COPY` opt-in for same-version/arch) | DDL, then `COPY … FROM STDIN` |
+| MySQL/MariaDB | `<obj>.schema.sql` (`SHOW CREATE …`) | `<obj>.data.tsv` — tab-separated, backslash-escaped, `\N` nulls | DDL, then batched multi-row `INSERT` |
+| MongoDB | `<coll>.metadata.json` (indexes + options) | `<coll>.bson` | `insertMany`, then `createIndexes` |
+
+Plus `manifest.json` (§2.1) with the dependency graph, counts, and content hashes.
+
+### 11.4 Supported server versions
+
+Each backend declares a supported range and **version-gates its catalog
+queries**; an unsupported server fails fast. Initial targets: PostgreSQL 13+,
+MySQL 8.0+ / MariaDB 10.6+, MongoDB 5.0+ — widened only as the fidelity suite
+(§12) passes for that version.
+
+---
+
+## 12. Verify — round-trip
+
+`arkstore verify` proves a backup is restorable (PRD §6.5):
+
+1. Select the backup as restore does (`--from`, default `latest`).
+2. Restore into a **throwaway** target — a `targets` entry flagged `ephemeral`,
+   or one Arkstore creates for the run — through the normal restore path (§5),
+   guards included.
+3. Compare against the **manifest baseline** (§2.1): every expected object
+   exists; row/document counts match; SQL per-table **order-independent content
+   hash** matches; Mongo index definitions match.
+4. Report `{verified, mismatched, failed}` per object with reasons; exit `1` on
+   any mismatch.
+5. Tear down only a target Arkstore created; never touch a pre-existing one.
+
+Runs on demand and in CI against containerized engines for every backend — the
+fidelity contract (§11.2) is gated by it. `--dry-run` reports without restoring.
