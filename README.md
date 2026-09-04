@@ -47,6 +47,10 @@ required, invoked, or shipped. Each backup is taken in one consistent snapshot.
 Engines are **opt-in at compile time**. Using an engine that wasn't built into
 the binary fails fast with a clear rebuild message. The default build is
 `postgres,archive,files`; `--features full` (or `--all-features`) builds everything.
+Each engine's driver is an optional dependency behind its feature — the Rust
+counterpart of Python's `package[extra]`, resolved at build time rather than
+install time — so pick the engines you need by choosing the release asset
+(`full`, or a slim per-engine build) or the `--features` line.
 
 ## Build
 

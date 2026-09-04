@@ -128,6 +128,36 @@ clear message: *"PostgreSQL support was not built into this binary. Rebuild with
 `--features postgres` or download the full release."* — the same "opt in to the engines you use"
 idea as package extras, but resolved at compile time into one self-contained artifact.
 
+Concretely, each feature toggles **optional dependencies** — a driver crate is compiled and linked
+only when its feature is on, so a slim build contains no MySQL or Mongo code at all:
+
+```toml
+[dependencies]
+tokio-postgres        = { version = "0.7",  optional = true }
+tokio-postgres-rustls = { version = "0.14", optional = true }
+mysql_async           = { version = "0.37", optional = true, default-features = false,
+                          features = ["rustls-tls"] }
+mongodb               = { version = "3",    optional = true }   # rustls-tls is its default
+bson                  = { version = "2",    optional = true }
+
+[features]
+default  = ["postgres", "archive", "files"]
+postgres = ["dep:tokio-postgres", "dep:tokio-postgres-rustls"]
+mysql    = ["dep:mysql_async"]
+mongo    = ["dep:mongodb", "dep:bson"]
+archive  = []   # arrow / parquet crates gated here from M2
+files    = []
+full     = ["postgres", "mysql", "mongo", "archive", "files"]
+```
+
+This is the Rust counterpart of Python's install extras (`package[mysql]`), with one deliberate
+difference: extras resolve at **install time** into an environment, whereas features resolve at
+**build time** into the binary — a shipped binary cannot acquire a driver later. The "choose your
+engines" moment is therefore choosing the **release asset** (`full`, or a slim per-engine build) or
+the `cargo install arkstore --features …` line, never a post-install step. Run-time plugin loading
+of drivers is deliberately not offered: it would require dynamic FFI (`unsafe`) and break the
+single-static-binary model (§13.8).
+
 Prebuilt releases: publish a **full-feature** binary per platform, plus optionally slim
 per-engine builds. Because it's one static binary, "install the right extra" becomes "download
 the right release asset."
@@ -150,12 +180,11 @@ lacks — **consistency** and **fidelity** — becomes an explicit requirement h
 rather than something inherited by shelling out.
 
 **Drivers (pure Rust, no C, statically linkable):** Postgres — `tokio-postgres` (`copy_in` /
-`copy_out`) or `sqlx`'s native Postgres driver (`copy_in_raw` / `copy_out_raw`); MySQL —
-`mysql_async` (or `sqlx` MySQL); MongoDB — the official `mongodb` crate with `bson`. TLS via
-`rustls`, never OpenSSL, so the musl static build stays free of system libraries — concretely:
-`tokio-postgres-rustls` (`MakeRustlsConnect`, MIT) for Postgres; `mysql_async`'s `rustls-tls`
-feature (it enables **no** TLS backend by default, so this must be selected explicitly); and
-`mongodb`'s default `rustls-tls` feature (OpenSSL is opt-in there and never chosen).
+`copy_out`) with `tokio-postgres-rustls` (`MakeRustlsConnect`, MIT); MySQL — `mysql_async` with
+its `rustls-tls` feature (it enables **no** TLS backend by default, so this is selected
+explicitly); MongoDB — the official `mongodb` crate (its default `rustls-tls`; OpenSSL is opt-in
+there and never chosen) with `bson`. TLS is `rustls` everywhere, never OpenSSL, so the musl static
+build stays free of system libraries. `sqlx` is deliberately not used (§16).
 
 #### 5.1.1 Consistency: one snapshot per source (required)
 
@@ -213,10 +242,15 @@ silently dropped — and the completeness gate (§6.1) still applies to every li
 | MySQL/MariaDB | `<obj>.schema.sql` — `SHOW CREATE …` output | `<obj>.data.tsv` — tab-separated, backslash-escaped, `\N` nulls (the server's own text row format) | apply DDL, then batched multi-row `INSERT` (never `LOAD DATA LOCAL INFILE`, which needs server-side opt-in) |
 | MongoDB | `<coll>.metadata.json` — indexes + options | `<coll>.bson` | `insertMany` batches, then `createIndexes` |
 
-Every archive carries `manifest.json` (§6.1), which also records each object's **dependency graph**
-(foreign-key parents, view dependencies), its **row/document count**, and (SQL engines) an
-**order-independent content hash** as seen in the snapshot — the inputs for restore ordering (§6.2)
-and `verify` (§6.5).
+Every archive carries `manifest.json` (§6.1; field-level schema in the KB), which also records each
+object's **dependency graph** (foreign-key parents, view dependencies), its **row/document count**,
+and (SQL engines) an **order-independent content hash** as seen in the snapshot — the inputs for
+restore ordering (§6.2) and `verify` (§6.5). The hash is `Σ SHA-256(row) mod 2^256` over each
+object's canonical row lines: streaming, commutative (so `verify` can recompute it in any row order),
+and sensitive to every row. Because canonical text depends on session settings, every dump **and**
+verify session pins the same set (`DateStyle`, `IntervalStyle`, `extra_float_digits`,
+`bytea_output`, `TimeZone`, `client_encoding`, …) before any `COPY`/`SELECT`, and the manifest
+records them — the KB specifies the exact set per engine.
 
 #### 5.1.4 Supported server versions
 
@@ -366,7 +400,12 @@ sub-action style, not a `--action` flag.)
 1. Resolve target → run the never-production guard.
 2. Build the engine loader (fails fast if that engine wasn't compiled in — §5).
 3. **Prove the target is empty before downloading or extracting** (a non-empty target aborts
-   early, before any transfer), unless it is a local single-dump restore.
+   early, before any transfer), unless it is a local single-dump restore. "Empty" is engine-defined
+   and strict — **Postgres:** no relations, views, sequences, functions, or types in any non-system
+   schema (anything outside `pg_catalog`, `information_schema`, `pg_toast`); **MySQL:** no tables,
+   views, routines, triggers, or events in the target database; **Mongo:** no collections in the
+   target database (system collections excluded); **file:** the target directory is absent or has
+   no entries.
 4. Resolve `--from`, download, and **safely extract** the archive (see §9.6 extraction hardening).
 5. **Validate the archive against its `manifest.json`.** The manifest is the authority on **which
    files each object is expected to have** — so "missing" always means *missing relative to what the
@@ -505,9 +544,14 @@ Verification proves a backup is restorable — the safety net that makes native 
 (§13.12).
 
 - **Select** a backup exactly as restore does (`--from`, default `latest`).
-- **Restore it into a throwaway target** — a `targets` entry flagged `ephemeral`, or a target
-  Arkstore creates for the run — through the normal restore path (§6.2): same code, same guards;
-  the never-production guard applies unchanged.
+- **Restore it into a throwaway target** through the normal restore path (§6.2) — same code, same
+  guards; the never-production guard applies unchanged. The target is one of:
+  - a `targets` entry flagged **`ephemeral: true`** — used as-is; it must pass the empty-target
+    check, and Arkstore **never drops it** (it did not create it); or
+  - **one Arkstore creates**: on a configured `verify.server` (host/port/user holding create rights
+    — `CREATEDB` on Postgres, `CREATE` on MySQL, `dbAdmin` on Mongo) it creates a database named
+    `arkstore_verify_<source>_<stamp>`, restores into it, and **always drops it** at the end —
+    on success, failure, or interrupt. It never drops a database it did not create.
 - **Compare** the result against the **manifest baseline** captured at dump time (§6.1): every
   expected object exists; per-object row/document counts match; for SQL engines the per-table
   **order-independent content hash** matches the value recorded in the snapshot; for Mongo, document
@@ -536,8 +580,9 @@ Three declarative layers:
    (`postgre` | `mysql` | `mongo` | `file`), `enable`. Databases add connection details
    (`host`, `port`, `user`, password-via-secret, optional TLS settings), and per source:
    `structure`, `data`, `ignore_startswith`, `ignore`, `include_privileges` (Postgres/MySQL,
-   default `false` — §5.1.2), `backup_to_s3`, `delete_after_upload`, `local_retention`, and
-   optional `archive` rules (block-YAML style). File sources add `path`, `ignore_extensions`. Mongo
+   default `false` — §5.1.2), `copy_format` (Postgres, `text` | `binary`, default `text` —
+   §5.1.3), `backup_to_s3`, `delete_after_upload`, `local_retention`, and optional `archive` rules
+   (block-YAML style). File sources add `path`, `ignore_extensions`. Mongo
    adds `authentication_database` (defaults to the db name).
 3. **Targets** (`targets.yaml`, optional): named restore targets — DBs `name`, `host`, `db`,
    `user`, password-via-secret, optional `port` and Mongo `auth_db`; file `name`, `path`. A missing
@@ -892,14 +937,20 @@ These are deliberate choices baked into the requirements above. They are recorde
 
 ## 16. Open Questions
 
-1. Default feature set for the primary release build — `postgres,archive,files` only, or `full`?
-2. Config format — stay YAML, or offer TOML (more idiomatic in Rust) too?
-3. Minimum supported object stores for v1 (AWS S3 + MinIO only, or GCS/Azure day one)?
-4. Postgres binary `COPY` — keep as opt-in only, or auto-select when source and target server
-   versions and architectures match?
-5. `tokio-postgres` vs `sqlx` as the Postgres driver (both pure Rust, both support `COPY`) — the
-   choice decides whether one driver stack (`sqlx`) can serve Postgres and MySQL together.
+**None open.** Every question raised during drafting has been decided and folded into the sections
+above. The record of each decision follows so the reasoning survives independently.
+
 **Resolved (now specified above):**
+- *Default feature set* — `postgres,archive,files`; release binaries ship `full` (§5, §11).
+- *Config format* — YAML for v1 (`serde_yaml`). TOML is not offered: one format, one loader.
+- *Object stores v1* — AWS S3 and S3-compatible endpoints (MinIO) via the `object_store`
+  abstraction (§9.4); GCS/Azure are M5.
+- *Postgres binary `COPY`* — opt-in only, per source (`copy_format: binary`); never auto-selected.
+  M0 implements text only.
+- *Driver stack* — `tokio-postgres` (+ `tokio-postgres-rustls`), `mysql_async` (`rustls-tls`), and
+  `mongodb` + `bson` (§5.1). `sqlx` is deliberately not used: its value — compile-time-checked
+  queries against a known schema — does not apply to a tool that reads arbitrary catalogs, and
+  `tokio-postgres`'s lower-level streaming `COPY` and session control fit the dump path better.
 - *Reuse vs. build for the Postgres schema dump* — **build, on a mature driver.** A survey of
   crates.io and GitHub (2026-09; source read at pinned commits) found no permissively-licensed,
   pure-Rust crate a correctness-first tool can depend on for a snapshot-consistent logical dump:
@@ -915,7 +966,7 @@ These are deliberate choices baked into the requirements above. They are recorde
     against §5.1.2); its driver is `0.1.0`, ~10 % documented, with no pipelining, no connection-URL
     parsing, and no `sslmode=verify-full` semantics (`Prefer` silently downgrades to plaintext).
     **Decision:** not a dependency — the wire layer is the commodity where maturity matters most, so
-    Arkstore uses `tokio-postgres`/`sqlx` (§5.1) — but the best public *reference* for catalog→DDL
+    Arkstore uses `tokio-postgres` (§5.1) — but the best public *reference* for catalog→DDL
     and parallel-snapshot orchestration; its "unsupported" list is a ready checklist of hard cases.
   - `pg_plumbing` (GitHub only, not on crates.io) — pure Rust on `tokio-postgres`; broad coverage
     incl. RLS, privileges, FDWs; writes real `PGDMP` custom/directory/tar archives. But it reads
