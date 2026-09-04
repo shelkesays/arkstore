@@ -3,51 +3,96 @@
 use std::process::ExitCode;
 
 use clap::Parser;
-use tracing::{debug, error};
+use tracing::{error, warn};
 use tracing_subscriber::EnvFilter;
 
 use arkstore::cli::{Cli, Command};
-use arkstore::config::Config;
-use arkstore::ops;
+use arkstore::config::{Config, ProcessEnv};
+use arkstore::error::ArkError;
+use arkstore::ops::{self, RestoreRequest, VerifyRequest};
+use arkstore::secrets;
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     let cli = Cli::parse();
     init_tracing(cli.log_level.as_deref());
 
-    match run(&cli) {
+    // Ctrl-C cancels in-flight work cooperatively; ops clean up via Drop
+    // guards and the process exits 130 (PRD §9.6).
+    let outcome = tokio::select! {
+        result = run(&cli) => result,
+        _ = tokio::signal::ctrl_c() => Err(ArkError::Interrupted),
+    };
+
+    match outcome {
         Ok(failed) if failed.is_empty() => ExitCode::SUCCESS,
         Ok(failed) => {
             error!(failed = ?failed, "one or more items failed");
             ExitCode::FAILURE
         }
+        Err(ArkError::Interrupted) => {
+            warn!("interrupted; cleaning up");
+            ExitCode::from(ArkError::Interrupted.exit_code())
+        }
         Err(err) => {
             error!(%err, "arkstore failed");
-            ExitCode::FAILURE
+            ExitCode::from(err.exit_code())
         }
     }
 }
 
-/// Load config and dispatch to the requested operation. Returns the names of
-/// items (sources/targets) that failed, so `main` can pick the exit code.
-fn run(cli: &Cli) -> arkstore::Result<Vec<String>> {
-    let config = Config::load(&cli.config)?;
-
-    let concurrency = config.concurrency.resolved();
-    debug!(
-        max_sources = concurrency.max_sources,
-        cpu_workers = concurrency.cpu_workers,
-        "resolved concurrency"
-    );
+/// Load config + secrets and dispatch. Returns the names of items that
+/// failed so `main` can pick the exit code.
+async fn run(cli: &Cli) -> arkstore::Result<Vec<String>> {
+    let mut config = Config::load(&cli.config)?;
+    if let Some(tz) = &cli.timezone {
+        config.app.timezone = tz.clone();
+        config.timezone()?;
+    }
+    secrets::load_secrets(&mut config, &ProcessEnv)?;
 
     match &cli.command {
-        Command::Backup { source, dry_run } => ops::backup(&config, source.as_deref(), *dry_run),
-        Command::Restore { source, dry_run } => ops::restore(&config, source.as_deref(), *dry_run),
+        Command::Backup {
+            kind,
+            source,
+            dry_run,
+        } => ops::backup(&config, *kind, source.as_deref(), *dry_run).await,
+        Command::Restore {
+            action,
+            source,
+            from,
+            target,
+            dry_run,
+        } => {
+            let request = RestoreRequest {
+                source: source.clone(),
+                action: *action,
+                from: from.clone(),
+                target: target.into(),
+            };
+            ops::restore(&config, &request, *dry_run).await
+        }
         Command::Cleanup {
             action,
             source,
             dry_run,
-        } => ops::cleanup(&config, *action, source.as_deref(), *dry_run),
-        Command::Archive { source, dry_run } => ops::archive(&config, source.as_deref(), *dry_run),
+        } => ops::cleanup(&config, *action, source.as_deref(), *dry_run).await,
+        Command::Archive { source, dry_run } => {
+            ops::archive(&config, source.as_deref(), *dry_run).await
+        }
+        Command::Verify {
+            source,
+            from,
+            target,
+            dry_run,
+        } => {
+            let request = VerifyRequest {
+                source: source.clone(),
+                from: from.clone(),
+                target: target.into(),
+            };
+            ops::verify(&config, &request, *dry_run).await
+        }
     }
 }
 
