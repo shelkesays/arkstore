@@ -42,7 +42,8 @@ binary, true parallelism, streaming I/O, and a strongly typed config.
 
 Every engine is driven **natively over its wire protocol** by a pure-Rust driver
 compiled into the binary — `pg_dump`, `mysqldump`, and `mongodump` are never
-required, invoked, or shipped. Each backup is taken in one consistent snapshot.
+required, invoked, or shipped. SQL backups are taken in one consistent snapshot per source; MongoDB is
+per-collection in v1 (cross-collection consistency is on the roadmap).
 
 Engines are **opt-in at compile time**. Using an engine that wasn't built into
 the binary fails fast with a clear rebuild message. The default build is
