@@ -74,8 +74,9 @@ fn loads_sibling_files_and_postgres_defaults() {
     assert_eq!(pg.port(), 5432);
     assert_eq!(pg.database(), "appdb");
     assert_eq!(pg.effective_ignore_startswith(), ["pg_", "rds_", "awsdms_"]);
-    assert_eq!(pg.copy_format, CopyFormat::Text);
-    assert!(!pg.include_privileges);
+    assert_eq!(pg.effective_copy_format(), CopyFormat::Text);
+    assert!(!pg.effective_include_privileges());
+    assert!(!pg.effective_allow_unsnapshotted_tables());
     assert!(pg.backup_to_s3 && pg.delete_after_upload);
     assert_eq!(pg.local_retention, 0);
 }
@@ -135,6 +136,10 @@ fn validation_errors_name_the_field() {
         (format!("{BASE}sources:\n  - {{name: 'bad name', type: file, path: /x}}\n"), "bad name"),
         (format!("{BASE}sources:\n  - {{name: a, type: postgre, user: u}}\n"), "`host`"),
         (format!("{BASE}sources:\n  - {{name: b, type: mysql, host: h, user: u, copy_format: binary}}\n"), "copy_format"),
+        // Explicitly setting the *default* on an unsupported engine is still a misconfiguration.
+        (format!("{BASE}sources:\n  - {{name: b, type: mysql, host: h, user: u, copy_format: text}}\n"), "copy_format"),
+        (format!("{BASE}sources:\n  - {{name: m, type: mongo, host: h, user: u, include_privileges: false}}\n"), "include_privileges"),
+        (format!("{BASE}sources:\n  - {{name: p, type: postgre, host: h, user: u, allow_unsnapshotted_tables: false}}\n"), "allow_unsnapshotted_tables"),
         (format!("{BASE}sources:\n  - {{name: a, type: postgre, host: h, user: u, allow_unsnapshotted_tables: true}}\n"), "allow_unsnapshotted_tables"),
         (format!("{BASE}sources:\n  - {{name: a, type: file, path: /x, archive: [{{table: t, time_column: c}}]}}\n"), "`archive`"),
         (format!("{BASE}sources:\n  - {{name: a, type: file, path: /x}}\n  - {{name: a, type: file, path: /y}}\n"), "duplicate source"),
