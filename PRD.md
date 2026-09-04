@@ -281,9 +281,15 @@ operation, so it is preview-first, target-guarded, and integrity-checked through
    early, before any transfer), unless it is a local single-dump restore.
 4. Resolve `--from`, download, and **safely extract** the archive (see §8 extraction hardening).
 5. **Validate the archive against its `manifest.json`** — verify each expected file is present and
-   matches its recorded `sha256`/size. A missing/mismatched *structure* file is non-fatal (fall
-   back to parsing the data file); a missing/corrupt *data* file drops that object and counts as a
-   failure.
+   matches its recorded `sha256`/size. A missing/corrupt *data* file drops that object and counts
+   as a failure. A missing/mismatched *structure* file is non-fatal **only when the object's schema
+   is otherwise available** — i.e. the data file is self-describing (carries its own DDL, as a full
+   per-table dump does) *or* the target already defines the object; in that case the restorer falls
+   back to deriving FK order (step 6) from the data file. If neither holds — a genuinely
+   **data-only** object whose target has no matching schema and whose data file carries no DDL —
+   the object **fails** (recorded, skipped) rather than loading partial or unusable data. The
+   never-silently-incomplete rule wins: an object is only "restored" if its schema exists or is
+   created.
 6. **Compute load order** — parse foreign-key relationships and topologically **layer** the
    objects so parents load before children (Mongo is a single layer). Cyclic dependencies are
    handled by loading the tables with **foreign-key application deferred**, then applying the
