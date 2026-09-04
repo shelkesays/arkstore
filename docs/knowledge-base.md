@@ -63,8 +63,8 @@ Per enabled source (narrowable to one engine type via `--type`, or one source vi
    A source may be structure-only, data-only, or both.
 4. **Completeness gate** — if *any* object fails to dump, **abort the source and
    upload nothing**. A partial archive is never produced.
-5. **Write `manifest.json`** at the archive root (database sources): format
-   version, source name, engine type + server version, snapshot identity,
+5. **Write `manifest.json`** at the archive root (database sources; schema in
+   §2.5): format version, source name, engine type + server version, snapshot identity,
    `created_at`; one entry per file `{path, object_name, kind, size, sha256}`; and
    per object its **dependency graph** (FK parents, view deps), **row/document
    count**, and (SQL) an order-independent **content hash** — the baseline for
@@ -105,6 +105,61 @@ Per enabled source (narrowable to one engine type via `--type`, or one source vi
 - An empty / no-match selection is a clean warning, not an error.
 - Exit `1` if any source failed, else `0`.
 - The `latest` pointer is the only mutable object (§Design decision 4, PRD §13).
+
+### 2.5 `manifest.json` v1
+
+The manifest is the archive's authority on what it contains (§5.4). Version 1:
+
+```json
+{
+  "manifest_version": 1,
+  "source": "appdb",
+  "engine": "postgre",
+  "server_version": "16.3",
+  "created_at": "2026-09-04T02:15:07Z",
+  "stamp": "2026-09-04-074507",
+  "timezone": "UTC",
+  "snapshot": { "kind": "pg_snapshot", "id": "00000003-00000002-1" },
+  "session": {
+    "DateStyle": "ISO, YMD", "IntervalStyle": "postgres", "extra_float_digits": "3",
+    "bytea_output": "hex", "TimeZone": "UTC", "client_encoding": "UTF8",
+    "standard_conforming_strings": "on"
+  },
+  "objects": [
+    {
+      "name": "public.orders",
+      "kind": "table",
+      "depends_on": ["public.customers"],
+      "row_count": 12345,
+      "content_hash": "sum256:9f2c…64 hex…",
+      "files": [
+        { "path": "public.orders.schema.sql", "role": "structure", "size": 812,   "sha256": "…" },
+        { "path": "public.orders.data.copy",  "role": "data",      "size": 90211, "sha256": "…" }
+      ]
+    }
+  ]
+}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `manifest_version` | int | `1`. Readers reject unknown versions. |
+| `source`, `engine` | string | Source name (§6.2 grammar); `postgre` \| `mysql` \| `mongo`. |
+| `server_version` | string | As reported by the server; gates restore-side behaviour (§11.4). |
+| `created_at` | RFC 3339 UTC | Wall-clock at snapshot open. |
+| `stamp`, `timezone` | string | The key stamp (§1) and the `app.timezone` it was rendered in. |
+| `snapshot` | object | `{kind, id}` — `pg_snapshot` + exported id; `mysql_consistent` + `null`; `mongo_none` + `null`. |
+| `session` | object | The pinned session settings the data was encoded under (§11.3); empty for Mongo. |
+| `objects[].name` | string | Schema-qualified (`schema.object`) or `db.collection`. |
+| `objects[].kind` | enum | `table` \| `view` \| `matview` \| `sequence` \| `function` \| `trigger` \| `type` \| `extension` \| `collection` \| `mongo_view`. |
+| `objects[].depends_on` | string[] | Names this object must be created/loaded **after** (FK parents, base relations, referenced types). Drives §5.5. |
+| `objects[].row_count` | int \| null | Rows/documents in the snapshot; `null` for kinds without data. |
+| `objects[].content_hash` | string \| null | `sum256:<64 hex>` (§11.3); SQL tables only. |
+| `objects[].files[]` | object[] | `{path, role, size, sha256}`; `role` ∈ `structure` \| `data` \| `metadata`; `path` relative to the archive root, no `..`, no leading `/`. |
+
+Rules: every file in the tar **must** appear in `objects[].files` — a file present in the archive but
+absent from the manifest is logged and **never loaded**; every listed file must exist and match
+its `size` + `sha256` (§5.4). A structure-only object simply lists no `data` file.
 
 ---
 
@@ -272,7 +327,11 @@ correctness-sensitive operation: preview-first, target-guarded, integrity-checke
 1. Resolve target → never-production guard.
 2. Build the engine loader (fails fast if that engine wasn't compiled in).
 3. **Prove the target is empty before download/extract** (non-empty ⇒ abort early,
-   before any transfer) — except a local single-dump restore.
+   before any transfer) — except a local single-dump restore. "Empty", strictly:
+   **Postgres** — no relations/views/sequences/functions/types in any non-system
+   schema (outside `pg_catalog`, `information_schema`, `pg_toast`); **MySQL** — no
+   tables/views/routines/triggers/events in the db; **Mongo** — no non-system
+   collections; **file** — directory absent or has no entries.
 4. Resolve `--from` → download → **safe-extract** (§8/PRD §9.6).
 5. **Validate against `manifest.json`.** The manifest is the authority on **which
    files each object should have** — "missing" means missing *relative to the
@@ -379,6 +438,7 @@ defaults:
 | `delete_after_upload` | all | `true` |
 | `local_retention` | all | `0` (disabled) |
 | `include_privileges` | postgre/mysql | `false` (§11.2) |
+| `copy_format` | postgre | `text` (`binary` opt-in — §11.3) |
 | `archive` | DB | `[]` (rules `{table, time_column, retention_days?}`) |
 | `path` | file | — (required) |
 | `authentication_database` | mongo | source `name` |
@@ -584,9 +644,13 @@ into the binary (PRD §5.1). No client tool is ever invoked. `pg_dump`,
 nothing they do is out of reach; what they guarantee — a consistent snapshot and
 a defined fidelity scope — is specified here instead of inherited.
 
-**Drivers:** Postgres `tokio-postgres` (or `sqlx` Postgres) — `COPY … TO STDOUT`
-/ `COPY … FROM STDIN`; MySQL `mysql_async` (or `sqlx` MySQL); Mongo the official
-`mongodb` crate + `bson`. TLS via `rustls`. All pure Rust, statically linkable.
+**Drivers (decided, PRD §16):** Postgres `tokio-postgres` + `tokio-postgres-rustls`
+— `copy_out` / `copy_in`; MySQL `mysql_async` with `rustls-tls` (no TLS backend
+is enabled by default — select it); Mongo the official `mongodb` crate (default
+`rustls-tls`) + `bson`. `sqlx` is not used. All pure Rust, statically linkable.
+Each driver is an **optional dependency** behind its Cargo feature (`postgres` /
+`mysql` / `mongo`), so a slim build contains no code for engines it lacks — the
+Rust counterpart of Python install extras, resolved at build time (PRD §5).
 
 ### 11.1 Snapshot consistency (required)
 
@@ -631,7 +695,30 @@ object.
 | MySQL/MariaDB | `<obj>.schema.sql` (`SHOW CREATE …`) | `<obj>.data.tsv` — tab-separated, backslash-escaped, `\N` nulls | DDL, then batched multi-row `INSERT` |
 | MongoDB | `<coll>.metadata.json` (indexes + options) | `<coll>.bson` | `insertMany`, then `createIndexes` |
 
-Plus `manifest.json` (§2.1) with the dependency graph, counts, and content hashes.
+Plus `manifest.json` (§2.5) with the dependency graph, counts, and content hashes.
+
+**Content hash (SQL tables).** Streaming, order-independent, and sensitive to every
+row: `content_hash = Σ SHA-256(row_bytes) mod 2^256`, rendered `sum256:` + 64 hex,
+where `row_bytes` is the exact canonical row line the engine emits — Postgres: the
+`COPY … TO STDOUT` text line without its trailing newline; MySQL: the TSV line.
+Addition is commutative, so `verify` (§12) recomputes it from the restored target
+in any row order and batch size; duplicated or dropped rows both change the value.
+`row_count` is stored alongside. It is a corruption detector, not a cryptographic
+commitment.
+
+**Canonical text depends on session settings**, so every dump *and* verify session
+pins the same set before any `COPY`/`SELECT`, and records it in the manifest
+(`session`) so a later verify encodes identically:
+
+| Engine | Pinned per session |
+|---|---|
+| PostgreSQL | `DateStyle='ISO, YMD'`, `IntervalStyle='postgres'`, `extra_float_digits=3`, `bytea_output='hex'`, `TimeZone='UTC'`, `client_encoding='UTF8'`, `standard_conforming_strings=on` |
+| MySQL/MariaDB | `SET NAMES utf8mb4`, `SET time_zone='+00:00'`, a fixed `sql_mode` (`STRICT_ALL_TABLES,NO_ZERO_DATE,...`), `SET SESSION group_concat_max_len` irrelevant (no aggregation) |
+| MongoDB | none — BSON is self-describing; `verify` compares counts and index definitions only |
+
+**Binary `COPY`** (`copy_format: binary`, opt-in) is faster for same-version/same-arch
+round-trips but its bytes are not the canonical text, so the content hash is still
+computed from a text export in a second pass — which is why text is the default.
 
 ### 11.4 Supported server versions
 
@@ -647,9 +734,13 @@ MySQL 8.0+ / MariaDB 10.6+, MongoDB 5.0+ — widened only as the fidelity suite
 `arkstore verify` proves a backup is restorable (PRD §6.5):
 
 1. Select the backup as restore does (`--from`, default `latest`).
-2. Restore into a **throwaway** target — a `targets` entry flagged `ephemeral`,
-   or one Arkstore creates for the run — through the normal restore path (§5),
-   guards included.
+2. Restore into a **throwaway** target through the normal restore path (§5),
+   guards included. Either a `targets` entry flagged `ephemeral: true` (used
+   as-is; must pass the empty check; **never dropped** — Arkstore didn't create
+   it), or one Arkstore **creates** on a configured `verify.server` (a user with
+   create rights: `CREATEDB` / `CREATE` / `dbAdmin`): database
+   `arkstore_verify_<source>_<stamp>`, restored into, then **always dropped** —
+   on success, failure, or interrupt. Never drops a database it did not create.
 3. Compare against the **manifest baseline** (§2.1): every expected object
    exists; row/document counts match; SQL per-table **order-independent content
    hash** matches; Mongo index definitions match.
