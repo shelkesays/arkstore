@@ -445,10 +445,18 @@ Requirements:
 - Strongly typed deserialization (serde) with **clear validation errors** naming the offending
   field/source, not a stack trace.
 - **Source names must be a safe single path segment** (they become S3 key components and local
-  directory names). The grammar is `^[A-Za-z0-9][A-Za-z0-9_.-]*$` — it must start with a letter or
-  digit, then contain only letters, digits, underscore (`_`), dot (`.`), or hyphen (`-`). No path
-  separators (`/`, `\`), no `..`, no whitespace, no leading punctuation, non-empty. Anything else is
-  rejected up front with an error naming the offending source.
+  directory/file names). The grammar is `^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$` — it must start with a
+  letter or digit, then contain only letters, digits, underscore (`_`), dot (`.`), or hyphen (`-`),
+  and be **1–64 characters** long. No path separators (`/`, `\`), no `..`, no whitespace, no leading
+  punctuation, non-empty. Anything else is rejected up front with an error naming the offending
+  source.
+  - **ASCII-only is deliberate:** Unicode names are rejected to avoid case-folding, Unicode
+    normalization, homoglyph, and cross-filesystem encoding hazards in the keys/paths derived from
+    the name (a design decision, not an oversight).
+  - **Length cap rationale:** 64 characters keeps every derived name — the local path components and
+    the S3 keys `<folder>/<source>/versioned/<source>.<stamp>.tar.gz` (which embed the source name
+    twice) — comfortably within the 255-byte filesystem path-component limit and the 1024-byte S3
+    object-key limit.
 - Sensible defaults so a minimal config works; every default documented (see the KB for the full
   default table).
 - Config file locations discoverable via flag / env / conventional path.

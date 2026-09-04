@@ -371,9 +371,14 @@ defaults:
 | `authentication_database` | mongo | source `name` |
 
 **Source `name`** must be a safe single path segment — it becomes an S3 key
-component and a local dir name. Grammar: `^[A-Za-z0-9][A-Za-z0-9_.-]*$` (starts
-with a letter/digit; then letters, digits, `_`, `.`, `-` only; no `/`/`\`, no
-`..`, no whitespace; non-empty). Anything else is rejected up front.
+component and a local dir/file name. Grammar: `^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`
+(starts with a letter/digit; then letters, digits, `_`, `.`, `-` only; **1–64
+chars**; no `/`/`\`, no `..`, no whitespace; non-empty). **ASCII-only by design**
+— Unicode is rejected to avoid case-fold / normalization / homoglyph and
+cross-filesystem encoding hazards. The 64-char cap keeps derived S3 keys
+(`<folder>/<source>/versioned/<source>.<stamp>.tar.gz`) and filenames within the
+255-byte filesystem component and 1024-byte S3 key limits. Anything else is
+rejected up front.
 
 ### 6.3 Targets (`targets.yaml`, optional)
 
