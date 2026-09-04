@@ -144,7 +144,7 @@ This is exposed as a per-source (or global) **`dump_strategy`** setting:
 
 The net effect: Mongo and MySQL deployments need **no external tools at all**; only Postgres
 *full logical backup/restore* still wants `pg_dump`/`pg_restore` on `PATH` until a native
-Postgres dump is proven out (a roadmap item, §14).
+Postgres dump is proven out (a roadmap item, §15).
 
 #### Why the native driver, not a REST API
 
@@ -168,17 +168,59 @@ self-contained API — rather than a REST layer.
 
 ### 6.1 Backup (`arkstore backup`)
 
-- Iterate all **enabled** sources (or a single source via `--source <name>`).
-- For a **database** source: produce a dump using the source's **dump strategy** (native Rust
-  backend or external client tool — see §5.1), stream it through compression, and upload to
-  object storage as `<source>.<timestamp>.tar.gz` (the engine-native dump format inside the archive).
-- For a **file** source: tar + compress the configured path tree and upload the same way.
-- Maintain a **`latest` pointer** object per source (`<source>.latest.tar.gz`) updated on each run.
-- **Timestamped, immutable** versioned objects under `versioned/`; the latest pointer is the
-  only mutable object.
+Iterate all **enabled** sources — optionally narrowed to one engine type via `--type <engine>`
+or a single named source via `--source <name>`.
+
+**Per-database-source pipeline:**
+
+1. **Enumerate the objects to dump** (tables / collections) from the live source, then apply the
+   source's ignore rules (below).
+2. **Dump each object** using the source's **dump strategy** (native Rust backend or external
+   client tool — see §5.1). What is dumped per object is governed by two per-source toggles:
+   - **`structure`** (schema/DDL) — when true, dump the object's definition.
+   - **`data`** (rows/documents) — when true, dump the object's contents.
+   A source may back up structure-only, data-only, or both.
+3. **Completeness gate** — if *any* object fails to dump, abort the source and upload **nothing**.
+   A backup archive is all-or-nothing; a partial archive that silently omits an object is a
+   restore-time data-loss trap and must never be produced.
+4. **Write a manifest** (database sources) — a `manifest.json` inside the archive recording a
+   format version, the source name and engine type, a creation timestamp, and one entry per
+   dumped file with its `{path, object_name, size, sha256}`. This is the integrity record the
+   restore path validates against (§6.2).
+5. **Package** — tar + stream through compression to a timestamped archive.
+6. **Upload** (when `backup_to_s3` is enabled) to object storage, then **verify** the upload
+   (size / checksum) before declaring success. A source may be configured local-only
+   (`backup_to_s3: false`).
+7. **Local artifact lifecycle** — the per-source working directory is always removed; local
+   copies of the finished archive are removed only when `delete_after_upload` is true *and* the
+   upload verified. When kept, **`local_retention: N`** prunes to the newest `N` versioned
+   archives per source (0 = unlimited / disabled); the `latest` pointer is always kept.
+
+**Ignore rules (per source):**
+
+- **`ignore_startswith`** — object-name prefixes excluded **outright** (no structure, no data).
+  Intended for engine/system objects (e.g. Postgres `pg_`, `rds_`, `awsdms_`; Mongo `system.`,
+  `local.`).
+- **`ignore`** — named objects whose **data** is skipped but whose **structure is still captured**
+  (the object is recreated empty on restore). Engines without this distinction (see §5.1) treat
+  `ignore` as an outright exclusion too; the split behaviour is documented per engine.
+
+**Per-file-source pipeline:** tar + compress the configured `path` tree and upload the same way.
+File sources honour `ignore` / `ignore_startswith` (fnmatch on the entry basename) and
+`ignore_extensions`; **symlinks are preserved but never followed**; the top-level entries under
+`path` are copied preserving their subtrees.
+
+**Versioning & pointer:**
+
+- **Timestamped, immutable** versioned objects live under `versioned/`.
+- A per-source **`latest` pointer** (`<source>.latest.tar.gz`) is rewritten each run and is the
+  **only** mutable object.
+
+**Invariants:**
+
 - Per-source **failure isolation**: one source failing (bad creds, missing tool, upload error)
   is logged and recorded; the run continues. Exit `1` if any source failed, else `0`.
-- Verify the upload (size / checksum) before considering the backup successful.
+- An empty / no-match source selection is a clean warning, not an error.
 - Never require network egress beyond the DB and the object store.
 
 **S3 layout:**
@@ -189,14 +231,81 @@ self-contained API — rather than a REST layer.
 
 ### 6.2 Restore (`arkstore restore`)
 
-- Select a backup to restore: the `latest` pointer (default) or a specific timestamp/key.
-- Download, decompress, and load into the configured **target** (which may differ from the
-  backup source — restore to a staging DB, a different host, etc.).
-- Engine-appropriate load per the **dump strategy** (§5.1): native Rust backend where available
-  (Mongo, MySQL), else the external client tool (`pg_restore`/`psql` for a Postgres full dump).
-- **Preview / safety:** confirm target before a destructive load; support `--dry-run` that
-  reports what would be restored (source key, size, target) without writing.
-- Per-target failure isolation and meaningful exit codes.
+Restore reconstructs a single named source into an operator-provided **target** that may differ
+from the original (a staging DB, a different host/database, a different directory). It targets one
+`--source` at a time — it never iterates all sources — and is the most correctness-sensitive
+operation, so it is preview-first, target-guarded, and integrity-checked throughout.
+
+**Sub-actions (`--action`):**
+
+- **`restore`** (default) — the full restore flow below.
+- **`list-backups`** — list the versioned backups available for the source (key, size,
+  last-modified), newest first. Reads only; writes nothing.
+
+**Target model:**
+
+- The target is resolved with precedence **CLI flag > environment variable > config**, per field
+  (`--target-host` / `--target-port` / `--target-db` / `--target-user` / `--target-path`, their
+  env equivalents, then a named entry in the `targets` config, else an inline `restore.target`).
+  Ports default per engine (Postgres 5432 / MySQL 3306 / Mongo 27017); Mongo `auth_db` defaults to
+  the target db.
+- The **target password is never taken from the command line** — environment variable, config, or
+  an interactive `getpass` prompt on a TTY only (see §8, §9.6).
+
+**Never-production guard (mandatory, runs before anything is read or written):**
+
+- Abort if the target host+port+db is identical to the source (refuse to restore onto the origin).
+- Warn if the target is the same server but a different database.
+- For file targets, reject a target path that overlaps the source path.
+
+**Backup selection (`--from`):**
+
+- `latest` (default) — the source's `latest` pointer.
+- a specific timestamp / object key — a chosen versioned backup.
+- a local dump file or archive path — for offline / single-item restores.
+
+**Restore flow (database source):**
+
+1. Resolve target → run the never-production guard.
+2. Build the engine loader (fails fast if that engine wasn't compiled in — §5).
+3. **Prove the target is empty before downloading or extracting** (a non-empty target aborts
+   early, before any transfer), unless it is a local single-dump restore.
+4. Resolve `--from`, download, and **safely extract** the archive (see §8 extraction hardening).
+5. **Validate the archive against its `manifest.json`** — verify each expected file is present and
+   matches its recorded `sha256`/size. A missing/mismatched *structure* file is non-fatal (fall
+   back to parsing the data file); a missing/corrupt *data* file drops that object and counts as a
+   failure.
+6. **Compute load order** — parse foreign-key relationships and topologically **layer** the
+   objects so parents load before children (Mongo is a single layer). Cyclic dependencies are
+   handled by loading the tables with **foreign-key application deferred**, then applying the
+   deferred constraints in a final pass.
+7. **Load** each object per its layer, then verify presence of the expected objects. Per-object
+   **failure isolation**: a failed object is recorded and skipped, never aborting the run
+   mid-way.
+8. Emit a **redacted summary** `{restored, skipped, failed}`; the temp working directory is always
+   cleaned up.
+
+**Structure-only restore:** an object that was backed up structure-only (or was in the `ignore`
+data-skip set, §6.1) is **recreated empty** from its structure file when no data file is present.
+
+**Single-item restore:** a local single dump file (`.sql` / engine archive) can be restored on its
+own; the target object must be **absent or empty** first. (Single-item file restore is not
+supported — file restores go through the full-tree path.)
+
+**Engine load specifics (see §5.1 for the dump-strategy split):**
+
+- Native Rust backend where available (Mongo, MySQL); otherwise the external client tool
+  (`pg_restore` / `psql`) for a Postgres full logical dump.
+- **SQL preprocessing** before load makes dumps portable across servers and privilege levels:
+  strip ownership (`ALTER … OWNER TO`) and `GRANT`/`REVOKE`, drop server-version-specific
+  statements the target can't accept (e.g. a newer server's `SET transaction_timeout`), and defer
+  `ADD CONSTRAINT … FOREIGN KEY` for cycle handling — all of it **`COPY`-block aware** so data
+  blocks are never corrupted.
+- **Retry-with-fallback:** if a permission error blocks disabling constraint triggers
+  (`session_replication_role = replica`), retry the load once without it rather than failing.
+
+**Preview / safety:** `--dry-run` runs every check and computes the load order but writes nothing;
+per-target failure isolation and meaningful exit codes throughout.
 
 ### 6.3 Cleanup / Retention (`arkstore cleanup`)
 
@@ -275,26 +384,39 @@ Moves aged rows from a live DB table to **Parquet** in object storage, keeping a
 
 ## 7. Configuration Model
 
-Two layers, both declarative:
+Three declarative layers:
 
-1. **Global policy** (`arkstore.yaml`): app settings (timezone), `aws`/object-store settings
-   (bucket, region, folder, endpoint for S3-compatible), and per-operation blocks — `cleanup`
-   (retention tiers, plans prefix, batch size, consolidate flag), `archive` (format, prefix,
-   default retention days, whole_months, delete_after_archive, dry_run, compression, fetch batch
-   size), and `concurrency` (`max_sources`, `cpu_workers` — see §9.5).
-2. **Sources** (`sources.yaml`): a list of source entries — `name`, `type`, `enable`, connection
-   details, optional `archive` rules (block-YAML style), `dump_strategy`
-   (`auto` | `native` | `external`, see §5.1), and restore target overrides.
+1. **Global policy** (`arkstore.yaml`): `app` settings (`name`, `timezone`, log level), `logger`
+   settings (§9.1 handlers), `aws`/object-store settings (`enable`, bucket, region, credentials or
+   instance-role, `folder`, endpoint for S3-compatible), and per-operation blocks:
+   - `cleanup` — retention tiers, `plans_prefix`, `delete_batch_size`, `dry_run`,
+     `consolidate_plans`.
+   - `archive` — `format`, `s3_prefix`, `default_retention_days`, `whole_months`,
+     `delete_after_archive`, `dry_run`, `compression`, `fetch_batch_size`.
+   - `concurrency` — `max_sources`, `cpu_workers` (§9.5).
+2. **Sources** (`sources.yaml`): a list of source entries. Common: `name`, `type`
+   (`postgre` | `mysql` | `mongo` | `file`), `enable`. Databases add connection details
+   (`host`, `port`, `user`, password-via-secret), and per source: `structure`, `data`,
+   `ignore_startswith`, `ignore`, `backup_to_s3`, `delete_after_upload`, `local_retention`,
+   optional `archive` rules (block-YAML style), and `dump_strategy` (`auto` | `native` |
+   `external`, see §5.1). File sources add `path`, `ignore_extensions`. Mongo adds
+   `authentication_database` (defaults to the db name).
+3. **Targets** (`targets.yaml`, optional): named restore targets — DBs `name`, `host`, `db`,
+   `user`, password-via-secret, optional `port` and Mongo `auth_db`; file `name`, `path`. A missing
+   targets file is not an error; targets may also be given inline as `restore.target` or overridden
+   entirely by CLI/env (§6.2).
 
-A global `dump_strategy` default may also live in the top-level config; a per-source value
-overrides it.
+A global `dump_strategy` default may live in the top-level config; a per-source value overrides it.
 
 Requirements:
 - Strongly typed deserialization (serde) with **clear validation errors** naming the offending
   field/source, not a stack trace.
-- Sensible defaults so a minimal config works; every default documented.
+- **Source names must be a safe single path segment** (they become S3 key components and local
+  directory names) — validated against a strict charset; anything else is rejected up front.
+- Sensible defaults so a minimal config works; every default documented (see the KB for the full
+  default table).
 - Config file locations discoverable via flag / env / conventional path.
-- **CLI flags override config** (e.g. `--dry-run`, `--source`).
+- **CLI flags override config** (e.g. `--dry-run`, `--source`, `--type`, restore target flags).
 
 ---
 
@@ -303,10 +425,15 @@ Requirements:
 - Credentials **never** live in the tracked config. Two backends:
   1. **Secrets manager** (AWS Secrets Manager first; pluggable) — gated by an env toggle.
   2. **Local secrets file** (e.g. `arkstore_secrets.yaml`) for dev/self-hosted.
-- Secrets merge into source connection details at load time.
+- Secrets merge into source/target connection details at load time.
 - The secret payload may also carry logging/observability config (e.g. ship logs to a collector),
   so a prod deployment can route logs centrally while local runs print to console.
 - Never log secret values; redact connection strings in output.
+- **Passwords are never passed on the command line** to child tools or captured in argv. Each
+  engine uses its safe channel — an environment variable the client tool reads
+  (`PGPASSWORD` / `MYSQL_PWD`), or a mode-`0600` temporary credentials file for tools that need one
+  (Mongo) — deleted after use. A restore target password may additionally come from an interactive
+  prompt on a TTY, never from argv (§9.6).
 
 ---
 
@@ -314,10 +441,19 @@ Requirements:
 
 ### 9.1 Logging & Observability
 - **Multi-level** structured logging: `debug` / `info` / `warning` / `error`, chosen by config/flag.
+- **Pluggable log sinks (handlers)**, each independently enable-able via config:
+  - **console** (default, always available);
+  - **file** — a rotating file handler (time-based rotation, e.g. rotate at midnight with a
+    bounded number of retained files);
+  - **error-reporting** — an optional error/exception reporting sink (Sentry-style), off by
+    default;
+  - **collector** — optional structured/JSON log shipping to a log collector (Grafana/Loki/
+    Alloy-style), off by default.
+- Handler settings (including the collector/error-reporting endpoints) may be delivered through
+  the secret payload (§8), so a prod deployment routes logs centrally while local runs print to
+  console.
 - Progress feedback for long operations (e.g. per-month `[i/N]` during archive, per-source
   during backup) so a long-running job never looks hung.
-- Optional structured/JSON logs and shipping to a collector (Grafana/Loki/Alloy-style) via the
-  secret/config-provided logger settings; console by default.
 - A concise run summary per operation (scanned/kept/deleted, bytes reclaimed, elapsed).
 
 ### 9.2 Safety & Correctness
@@ -329,7 +465,8 @@ Requirements:
 
 ### 9.3 Exit Codes
 - `0` clean run; `1` any per-item failure or a known top-level error (e.g. missing bucket/region);
-  distinct handling for expected vs. unexpected errors (traceback only for the unexpected).
+  `130` on user interrupt (SIGINT, §9.6); distinct handling for expected vs. unexpected errors
+  (traceback only for the unexpected).
 
 ### 9.4 Object Store
 - S3 first via an object-store abstraction (`object_store` crate) so MinIO / S3-compatible and,
@@ -377,13 +514,41 @@ joined; failures aggregate into the exit code), **verify-before-delete** (each p
 waits on its own verified upload; parallel months are disjoint partitions), and readable output
 (every log line is tagged with its `source`).
 
+### 9.6 Robustness & hardening
+
+Backup/restore handle untrusted or hostile inputs (archives pulled from object storage, dump files
+whose contents originate outside the tool), so the following are hard requirements, not nice-to-haves:
+
+- **Safe archive extraction.** Extracting a downloaded archive must reject path traversal
+  (`..`, absolute paths), escaping symlinks/hardlinks, and special members — extract data members
+  only. No archive may write outside its intended temp directory.
+- **Object-key confinement.** A restore-selected object key is confined under the source's prefix;
+  reject `..` and absolute/rooted keys. Persisted-plan paths (cleanup) are resolved under the
+  plans prefix with the same rejection.
+- **Disk-space headroom check** before downloading/extracting a backup — require comfortable
+  headroom (e.g. a multiple of the archive size) so a restore can't fill the disk mid-extract.
+- **Dump-file validation.** A dump file must be non-empty and shape-checked (e.g. a `.sql` file
+  must contain SQL) before it is fed to a loader; zero-byte or garbage files are skipped and
+  reported, never silently "restored".
+- **Identifier validation.** Table/collection identifiers derived from untrusted dump/file names
+  are validated against a strict charset and safely quoted before use in any statement — no
+  interpolation of unvalidated names.
+- **Error redaction.** When a child tool fails, surface only its exit code and a safe message —
+  never its argv, stdout, or stderr, which can carry connection strings or secrets.
+- **Signal handling.** A user interrupt (Ctrl-C / SIGINT) aborts promptly and cleanly, cleaning up
+  temp working directories, and exits with the conventional interrupted code (`130`); an interrupt
+  during a child dump tool is surfaced as an interrupt, not a spurious failure.
+
 ---
 
 ## 10. CLI Design (proposed)
 
 ```
-arkstore backup   [--source <name>] [--dry-run] [--config <path>]
-arkstore restore  [--source <name>] [--target <name>] [--from <stamp|latest>] [--dry-run]
+arkstore backup   [--type <engine>] [--source <name>] [--dry-run] [--config <path>]
+arkstore restore  [restore | list-backups]
+                  [--source <name>] [--from <stamp|key|latest>]
+                  [--target-host <h>] [--target-port <p>] [--target-db <d>]
+                  [--target-user <u>] [--target-path <path>] [--dry-run]
 arkstore cleanup  [generate-plan | execute-plan <plan> | run | consolidate-plans]
                   [--source <name>] [--dry-run]
 arkstore archive  [--source <name>] [--dry-run]
@@ -392,7 +557,11 @@ Global: --config, --log-level, --timezone, --version, --help
 ```
 
 - Subcommand-per-operation (clap-derive), consistent flags across operations.
-- `--dry-run` and `--source` available wherever they make sense.
+- `--dry-run` and `--source` available wherever they make sense; `--type` narrows `backup` to one
+  engine type.
+- Restore takes an **action** (`restore` default, `list-backups`), a `--from` selector, and
+  per-field **target overrides** (which beat env, which beat config — §6.2). The target password is
+  never a flag (§8).
 - `arkstore --version` prints version **and the engines compiled in**.
 
 ---
@@ -418,7 +587,7 @@ and Windows; one static binary per platform, built from one codebase.
   `external` dump strategy, which needs `pg_dump`/`pg_restore` on `PATH` (see §5.1). Every other
   path is pure Rust: Mongo and MySQL backup/restore use native backends, and all archival and
   file operations need nothing external. Per-OS notes cover the Postgres case, and a native
-  Postgres dump is a roadmap item (§14) to close it.
+  Postgres dump is a roadmap item (§15) to close it.
 - **CI builds and tests on Linux, macOS, and Windows** on every change; the release workflow
   cross-builds the full target matrix on tags.
 - Container image: distroless/minimal base + the static binary; no interpreter, tiny image.
@@ -426,7 +595,7 @@ and Windows; one static binary per platform, built from one codebase.
 
 ---
 
-## 12. Improvements Over the Predecessor (the "much better" part)
+## 12. Design Advantages
 
 1. **One static binary, zero runtime** — no Python/venv/lockfile to provision; trivial to ship in
    a scratch/distroless container or drop on a host.
@@ -446,7 +615,69 @@ and Windows; one static binary per platform, built from one codebase.
 
 ---
 
-## 13. Non-Functional Requirements
+## 13. Design Decisions & Rationale
+
+These are deliberate choices baked into the requirements above. They are recorded here so the
+"why" survives independently of any implementation — each stands on its own reasoning.
+
+1. **Sortable timestamps in keys.** Backup object stamps use a lexicographically-sortable form
+   (`YYYY-MM-DD-HHMMSS`) so a plain object listing sorts chronologically without parsing, and the
+   newest backup is trivially the max key. The stamp is rendered in `app.timezone`. *(The same
+   value is what the cleanup parser reads back — one format, writer and reader agree.)*
+
+2. **One timezone for every calendar decision.** Both cleanup banding and the archive cutoff are
+   computed in `app.timezone` (weeks start Monday; cutoffs at local midnight). Using a single
+   configured timezone — rather than the host's local time or raw UTC — makes retention and archive
+   boundaries deterministic across hosts and DST changes, and keeps "which day/week/month is this"
+   consistent between the two operations. Rationale: a backup taken at 23:30 local should belong to
+   *that* local day, not slip into the next UTC day.
+
+3. **Config is a small fixed set of files, not a merged directory.** Configuration is three
+   explicit layers — global policy, `sources`, and (optional) `targets`. This keeps the effective
+   config obvious and diffable; secrets are the only thing merged in at load time (§8), and CLI/env
+   override at the edges (§7). Rationale: predictable precedence beats "whatever happened to be on
+   the config path."
+
+4. **The `latest` pointer is the only mutable object.** Every versioned backup is write-once and
+   never overwritten; only `<source>.latest.tar.gz` is rewritten each run. Rationale: immutable
+   history is safe to cold-tier and safe to reason about in retention; a single mutable pointer
+   gives O(1) "give me the newest" without listing.
+
+5. **Archives live outside the backup folder.** Archived Parquet uses a sibling top-level prefix
+   (`archive.s3_prefix`), never under `aws.folder`. Rationale: cleanup scans the backup folder by
+   key shape, and archives must be structurally invisible to it — a Parquet key can never be
+   mistaken for a backup key and pruned. (Even if scanned, its shape is unparsable ⇒ kept — §6.3.)
+
+6. **Cleanup scans object storage, not the config.** Retention decisions come from what is actually
+   in the bucket, so backups from sources later removed from config are still pruned. Rationale:
+   the bucket is the source of truth for what exists; config drift must not orphan storage forever.
+
+7. **Native wire-protocol drivers, external tools only where fidelity demands it.** Backup/restore
+   prefer the engine's native Rust driver (the wire protocol *is* the API — §5.1), falling back to
+   an external client tool only where nothing in pure Rust matches its fidelity (Postgres full
+   logical schema). Rationale: fewer host prerequisites, no version-matching of client tools, and
+   streaming binary bulk paths — without ever trading away restore fidelity.
+
+8. **Engine selection is compile-time, not runtime.** Engines are Cargo features producing one
+   self-contained artifact (§5); using an engine not built in fails fast with a rebuild message.
+   Rationale: a single static binary with no package-index resolution at deploy, and no way to
+   "accidentally" depend on an engine that isn't actually present.
+
+9. **Backups are all-or-nothing, with a manifest.** A source aborts and uploads nothing if any
+   object fails to dump, and every database archive carries a `manifest.json` with a `sha256` per
+   file that restore validates (§6.1/§6.2). Rationale: a partial archive that silently drops an
+   object is indistinguishable from a good one until a restore fails — so it must never be produced,
+   and integrity must be checkable at restore time, not assumed.
+
+10. **`structure`/`data` toggles and split `ignore` semantics.** A source controls schema and data
+    independently, and `ignore` skips an object's *data while keeping its structure* (recreated
+    empty on restore), distinct from `ignore_startswith` which drops the object entirely. Rationale:
+    real deployments need "keep the shape of this table but not its (huge/sensitive/transient) rows"
+    without losing the schema — a single exclude list can't express that.
+
+---
+
+## 14. Non-Functional Requirements
 
 - **Safety:** no `unsafe`; every destructive op preview-first and verify-before-delete.
 - **Performance:** parallel sources; streaming I/O; bounded memory independent of dataset size;
@@ -459,7 +690,7 @@ and Windows; one static binary per platform, built from one codebase.
 
 ---
 
-## 14. Milestones / Roadmap
+## 15. Milestones / Roadmap
 
 - **M0 — Skeleton:** CLI, config/secrets loading, object-store abstraction, logging, dry-run
   plumbing, one engine (Postgres) backup + restore.
@@ -474,14 +705,18 @@ and Windows; one static binary per platform, built from one codebase.
 
 ---
 
-## 15. Open Questions
+## 16. Open Questions
 
 1. Default feature set for the primary release build — `postgres,archive,files` only, or `full`?
 2. Config format — stay YAML, or offer TOML (more idiomatic in Rust) too?
-3. Restore target model — reuse source entries with overrides, or a separate `targets` list?
-4. Is a `verify` (round-trip restore) operation in scope for v1 or roadmap?
-5. Minimum supported object stores for v1 (AWS S3 + MinIO only, or GCS/Azure day one)?
-6. Native Postgres logical dump — is matching `pg_dump` fidelity (extensions, custom types,
+3. Is a `verify` (round-trip restore) operation in scope for v1 or roadmap?
+4. Minimum supported object stores for v1 (AWS S3 + MinIO only, or GCS/Azure day one)?
+5. Native Postgres logical dump — is matching `pg_dump` fidelity (extensions, custom types,
    partitioning, privileges) worth the effort/risk, or is `external` the permanent answer for
    Postgres full backups?
-```
+
+**Resolved (now specified above):**
+- *Restore target model* — a dedicated optional `targets` layer, overridable inline and by
+  CLI/env with per-field precedence (§6.2, §7). No longer open.
+- *Calendar timezone* — all calendar math (cleanup banding + archive cutoff) uses `app.timezone`
+  (§13.2). No longer open.

@@ -39,22 +39,54 @@ says *exactly how*.
 
 ## 2. Backup
 
-Per enabled source (or one via `--source`):
+Per enabled source (narrowable to one engine type via `--type`, or one source via
+`--source`):
 
-1. **Database** — produce a dump via the engine's standard mechanism, stream it
-   through gzip, upload to `versioned/<source>.<stamp>.tar.gz`.
-2. **File** — tar + gzip the configured `path` tree, upload the same way.
-3. **Verify** the upload (size / checksum) before declaring success.
-4. **Update** `<source>.latest.tar.gz` to point at / contain the new backup.
+### 2.1 Database source
 
-**Invariants**
+1. **Enumerate objects** (tables / collections) from the live source; apply the
+   source's ignore rules (§2.3).
+2. **Dump each object** per the source's `dump_strategy` (§8) and its
+   `structure` / `data` toggles:
+   - `structure: true` → dump the object's DDL/definition.
+   - `data: true` → dump the object's rows/documents.
+   A source may be structure-only, data-only, or both.
+3. **Completeness gate** — if *any* object fails to dump, **abort the source and
+   upload nothing**. A partial archive is never produced.
+4. **Write `manifest.json`** at the archive root (database sources): format
+   version, source name, engine type, `created_at`, and one entry per file
+   `{path, object_name, size, sha256}`.
+5. **Package** — tar + stream through gzip to `versioned/<source>.<stamp>.tar.gz`.
+6. **Upload** (when `backup_to_s3`), then **verify** (size / checksum) before
+   declaring success. `backup_to_s3: false` keeps the backup local only.
+7. **Local lifecycle** — always remove the per-source working dir; remove the
+   local finished archive only when `delete_after_upload` *and* the upload
+   verified. Otherwise **`local_retention: N`** keeps the newest `N` versioned
+   archives per source (`0` = disabled); the `latest` pointer is always kept.
+
+### 2.2 File source
+
+- tar + gzip the configured `path` tree; upload the same way.
+- Honours `ignore` / `ignore_startswith` (fnmatch on the entry **basename**) and
+  `ignore_extensions`. **Symlinks are preserved but never followed.** Top-level
+  entries under `path` are copied preserving their subtrees.
+
+### 2.3 Ignore semantics (per source)
+
+- **`ignore_startswith`** — object-name prefixes excluded **outright** (no
+  structure, no data). Typical defaults: Postgres `pg_` / `rds_` / `awsdms_`;
+  Mongo `system.` / `local.`.
+- **`ignore`** — named objects whose **data is skipped but structure is kept**
+  (recreated empty on restore, §5.6). Engines without the split (MySQL, Mongo,
+  file) treat `ignore` as an outright exclusion too.
+
+### 2.4 Invariants
 
 - Per-source **failure isolation**: a bad source (creds, missing tool, upload
   error) is logged + recorded; the run continues to the next source.
+- An empty / no-match selection is a clean warning, not an error.
 - Exit `1` if any source failed, else `0`.
-- Engine mechanism: SQL engines use their dump CLIs (`pg_dump`/`mysqldump`) where
-  practical; Mongo uses the native driver. (Archive uses native drivers for all —
-  see §4.)
+- The `latest` pointer is the only mutable object (§Design decision 4, PRD §13).
 
 ---
 
@@ -185,27 +217,150 @@ to the delete for that month.
 
 ## 5. Restore
 
-- Select the backup: the `latest` pointer (default) or a specific timestamp/key.
-- Download → decompress → load into the configured **target** (which may differ
-  from the source: a staging DB, a different host).
-- Engine-appropriate load; per-target failure isolation; `--dry-run` reports the
-  key/size/target without writing.
+Restore reconstructs **one** named `--source` into an operator-provided target
+that may differ from the origin. It never iterates sources. It is the most
+correctness-sensitive operation: preview-first, target-guarded, integrity-checked.
+
+### 5.1 Actions & selection
+
+- **`restore`** (default) — the full flow below.
+- **`list-backups`** — list versioned backups for the source (key / size /
+  last-modified), newest first; reads only.
+- **`--from`** selects the backup: `latest` (default), a specific stamp/key, or a
+  local dump/archive path (offline / single-item).
+
+### 5.2 Target resolution
+
+- Per field, precedence is **CLI flag > env var > config**:
+  `--target-host/-port/-db/-user/-path`, then env, then a named entry in
+  `targets` (or inline `restore.target`).
+- Ports default per engine (5432 / 3306 / 27017); Mongo `auth_db` defaults to the
+  target db.
+- **Password never comes from argv** — env / config / interactive `getpass` on a
+  TTY only (§6, §8).
+
+### 5.3 Never-production guard (runs first, before any read/write)
+
+- **Abort** if target host+port+db is identical to the source.
+- **Warn** if same server, different db.
+- **Reject** a file target path that overlaps the source path.
+
+### 5.4 Flow (database source)
+
+1. Resolve target → never-production guard.
+2. Build the engine loader (fails fast if that engine wasn't compiled in).
+3. **Prove the target is empty before download/extract** (non-empty ⇒ abort early,
+   before any transfer) — except a local single-dump restore.
+4. Resolve `--from` → download → **safe-extract** (§8/PRD §9.6).
+5. **Validate against `manifest.json`** — each expected file present, `sha256`/size
+   match. A missing/mismatched **structure** file is non-fatal (fall back to
+   parsing the data file); a missing/corrupt **data** file drops that object and
+   counts as a failure.
+6. **Compute load order** (§5.5).
+7. **Load** per layer, then verify object presence. Per-object failure isolation:
+   a failed object is recorded + skipped, never aborting the run.
+8. Emit a redacted `{restored, skipped, failed}` summary; temp dir always cleaned.
+
+### 5.5 Foreign-key ordering
+
+- Parse FK relationships (`FOREIGN KEY … REFERENCES <parent>`) **COPY-block-aware**,
+  and topologically **layer** objects so parents load before children. Mongo is a
+  single layer (no FKs).
+- **Cycles**: load the tables with FK **application deferred**, then apply the
+  deferred constraints in a final pass.
+
+### 5.6 SQL preprocessing (before load)
+
+Makes dumps portable across servers/privilege levels — all **COPY-aware** so data
+blocks are untouched:
+
+- strip `ALTER … OWNER TO` and `GRANT` / `REVOKE`;
+- drop statements a target server can't accept (e.g. a newer server's
+  `SET transaction_timeout`);
+- defer `ADD CONSTRAINT … FOREIGN KEY` (feeds the cycle handling in §5.5).
+
+**Retry-with-fallback:** if a permission error blocks disabling constraint triggers
+(`session_replication_role = replica`), retry the load once without it.
+
+### 5.7 Structure-only & single-item restore
+
+- **Structure-only** — an object backed up structure-only (or in the data-skip
+  `ignore` set, §2.3) is **recreated empty** from its structure file when no data
+  file is present.
+- **Single-item** — a local single dump (`.sql` / engine archive) restores on its
+  own; the target object must be **absent or empty** first. (Single-item **file**
+  restore is unsupported — file restores use the full-tree path.)
+
+### 5.8 File restore
+
+- Extract the archive; copy the tree into an **empty** target directory.
+- `--dry-run` reports what would be written without writing.
+
+### 5.9 Dry-run
+
+Runs every check and computes the load order but writes nothing.
 
 ---
 
 ## 6. Configuration & secrets
 
-- **Global policy** (`arkstore.yaml`): `app` (timezone, log level), `aws` (bucket,
-  region, folder, endpoint), `cleanup`, `archive`. See
-  [`arkstore.example.yaml`](../arkstore.example.yaml).
-- **Sources**: `name`, `type` (`postgre|mysql|mongo|file`), `enable`, connection
-  details, optional `archive` rules (block-YAML style), file `path`.
-- **Precedence:** CLI flags (`--dry-run`, `--source`) override config.
+Three declarative layers (PRD §7). See [`arkstore.example.yaml`](../arkstore.example.yaml).
+
+### 6.1 Global policy (`arkstore.yaml`)
+
+- `app` — `name`, `timezone` (drives **all** calendar math — §3, §4), log level.
+- `logger` — handler toggles: `console` (default), `file` (rotating; time-based,
+  e.g. rotate at midnight, keep N files), `error-reporting` (Sentry-style, off),
+  `collector` (JSON/Loki/Alloy shipping, off). Endpoints may arrive via the secret.
+- `aws` — `enable`, `region`, credentials **or** instance-role, `bucket`,
+  `folder`, S3-compatible `endpoint`.
+- `cleanup` — `retention.{daily,weekly,monthly,yearly}`, `plans_prefix`,
+  `delete_batch_size` (≤1000), `dry_run`, `consolidate_plans`.
+- `archive` — `format`, `s3_prefix`, `default_retention_days`, `whole_months`,
+  `delete_after_archive`, `dry_run`, `compression`, `fetch_batch_size`.
+- `concurrency` — `max_sources`, `cpu_workers` (§9).
+
+### 6.2 Sources (`sources.yaml`)
+
+Common: `name`, `type` (`postgre|mysql|mongo|file`), `enable`. Databases add
+`host`, `port`, `user`, password-via-secret. Per-source options and typical
+defaults:
+
+| Option | Applies | Default |
+|---|---|---|
+| `structure` | DB (mongo: false) | `true` |
+| `data` | DB | `true` |
+| `ignore_startswith` | DB/file | pg: `['pg_','rds_','awsdms_']`; mongo: `['system.','local.']`; else `[]` |
+| `ignore` | DB/file | mongo: `['system.profile','local.startup_log']`; else `[]` |
+| `ignore_extensions` | file | `['photoslibrary','DS_Store','localized']` |
+| `backup_to_s3` | all | `true` |
+| `delete_after_upload` | all | `true` |
+| `local_retention` | all | `0` (disabled) |
+| `dump_strategy` | DB | `auto` (§8, PRD §5.1) |
+| `archive` | DB | `[]` (rules `{table, time_column, retention_days?}`) |
+| `path` | file | — (required) |
+| `authentication_database` | mongo | source `name` |
+
+**Source `name`** must be a safe single path segment (strict charset) — it becomes
+an S3 key component and a local dir name.
+
+### 6.3 Targets (`targets.yaml`, optional)
+
+Named restore targets: DBs `name`, `host`, `db`, `user`, password-via-secret,
+optional `port` and mongo `auth_db`; file `name`, `path`. Missing file is fine;
+targets may be inline (`restore.target`) or fully overridden by CLI/env (§5.2).
+
+### 6.4 Precedence & secrets
+
+- **Precedence:** CLI flags (`--dry-run`, `--source`, `--type`, target flags)
+  override env, which override config.
 - **Secrets** never live in the tracked config — merged in at load time from a
   secrets manager (AWS Secrets Manager first) or a local secrets file, keyed by
-  source name. The secret payload may also carry logging/observability config
-  (e.g. ship logs to a collector), so prod can route logs centrally while local
-  runs print to console. Never log secret values.
+  source/target name. The secret payload may also carry logging/observability
+  config, so prod can route logs centrally while local runs print to console.
+- **Never log secret values.** DB passwords never reach argv — the client tool's
+  env var (`PGPASSWORD` / `MYSQL_PWD`) or a `0600` temp credentials file (Mongo),
+  removed after use. Restore target password may also come from a TTY prompt.
 
 ---
 
@@ -256,15 +411,39 @@ backup and archive rules **together in one call**, or existing rules are wiped.
 
 ## 8. Cross-cutting
 
-- **Logging:** multi-level (`debug`/`info`/`warn`/`error`); progress feedback for
-  long ops (per-month `[i/N]` in archive, per-source in backup) so a long run
-  never looks hung; concise per-op summary; optional JSON/collector shipping.
+- **Logging:** multi-level (`debug`/`info`/`warn`/`error`); pluggable handlers
+  (console / rotating file / error-reporting / collector — §6.1); progress
+  feedback for long ops (per-month `[i/N]` in archive, per-source in backup) so a
+  long run never looks hung; concise per-op summary.
 - **Exit codes:** `0` clean; `1` any per-item failure or a known top-level error
-  (missing `aws.bucket`/`aws.region`, invalid plan, unknown action). Traceback
-  only for the unexpected.
+  (missing `aws.bucket`/`aws.region`, invalid plan, unknown action); `130` on user
+  interrupt (SIGINT). Traceback only for the unexpected.
 - **Dry-run** on every destructive operation: zero writes, zero deletes.
 - **Verify-before-delete** for both archive (upload verified before row delete)
   and backup.
+
+### 8.1 Robustness & hardening (handling untrusted input)
+
+Archives and dump files can originate outside the tool, so these are hard
+requirements (PRD §9.6):
+
+- **Safe extraction** — reject path traversal (`..`, absolute), escaping
+  symlinks/hardlinks and special members; extract data members only; never write
+  outside the temp dir.
+- **Object-key / plan-path confinement** — restore keys confined under the
+  source prefix; persisted-plan paths resolved under `plans_prefix`; reject `..`
+  and rooted paths.
+- **Disk-space headroom** check (a multiple of the archive size) before
+  download/extract.
+- **Dump-file validation** — non-empty + shape-checked (a `.sql` must contain SQL)
+  before loading; zero-byte/garbage files skipped + reported, never restored.
+- **Identifier validation** — table/collection names from untrusted dump/file
+  names validated to a strict charset and safely quoted; no unvalidated
+  interpolation.
+- **Error redaction** — on child-tool failure surface only the exit code + a safe
+  message, never argv/stdout/stderr (can carry secrets).
+- **Signals** — Ctrl-C aborts promptly, cleans temp dirs, exits `130`; an
+  interrupt during a child dump tool is surfaced as an interrupt, not a failure.
 
 ---
 
