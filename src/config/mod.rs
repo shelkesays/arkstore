@@ -137,9 +137,12 @@ struct TargetsFile {
 }
 
 impl Config {
-    /// Load `arkstore.yaml`, pull in sibling `sources.yaml` / `targets.yaml`
-    /// when the inline lists are empty, and validate everything.
-    pub fn load(path: &Path) -> Result<Self> {
+    /// Read `arkstore.yaml` and pull in sibling `sources.yaml` /
+    /// `targets.yaml` when the inline lists are empty — **without**
+    /// validating. Callers apply CLI overrides and merge secrets first, then
+    /// call [`Config::validate`], so a `host` or `user` that lives only in the
+    /// secrets file, or a `--timezone` override, is in place before checks run.
+    pub fn load_unvalidated(path: &Path) -> Result<Self> {
         let mut config: Config = read_yaml(path)?;
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
         if config.sources.is_empty() {
@@ -152,6 +155,13 @@ impl Config {
                 config.targets = file.targets;
             }
         }
+        Ok(config)
+    }
+
+    /// [`Config::load_unvalidated`] followed by [`Config::validate`] — for callers with
+    /// no overrides or secrets to merge.
+    pub fn load(path: &Path) -> Result<Self> {
+        let config = Self::load_unvalidated(path)?;
         config.validate()?;
         Ok(config)
     }

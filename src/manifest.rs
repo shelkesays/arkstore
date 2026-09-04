@@ -158,8 +158,9 @@ impl Manifest {
 
     /// Topologically layer objects by `depends_on` (Kahn's algorithm).
     /// Dependencies on objects not in the manifest are ignored (the object may
-    /// have been excluded by an ignore rule). Objects in a cycle are returned
-    /// separately so the loader can defer their constraints.
+    /// have been excluded by an ignore rule). Objects in a cycle — including a
+    /// self-reference such as a table with a foreign key to itself — are
+    /// returned separately so the loader can defer their constraints.
     pub fn load_plan(&self) -> LoadPlan<'_> {
         let (mut indegree, dependents) = self.dependency_graph();
         let mut placed = vec![false; self.objects.len()];
@@ -195,8 +196,7 @@ impl Manifest {
             let deps = object
                 .depends_on
                 .iter()
-                .filter_map(|d| index.get(d.as_str()).copied())
-                .filter(|&d| d != i);
+                .filter_map(|d| index.get(d.as_str()).copied());
             for dep in deps {
                 indegree[i] = indegree[i].saturating_add(1);
                 dependents[dep].push(i);
@@ -249,7 +249,7 @@ fn validate_object<'a>(
             object.name
         )));
     }
-    if !object.schema_hash.starts_with("sha256:") {
+    if !has_digest(&object.schema_hash, "sha256:") {
         return Err(ArkError::Manifest(format!(
             "object `{}`: schema_hash must be `sha256:<hex>`",
             object.name
@@ -258,7 +258,7 @@ fn validate_object<'a>(
     if object
         .content_hash
         .as_deref()
-        .is_some_and(|h| !h.starts_with("sum256:"))
+        .is_some_and(|h| !has_digest(h, "sum256:"))
     {
         return Err(ArkError::Manifest(format!(
             "object `{}`: content_hash must be `sum256:<hex>`",
@@ -283,13 +283,22 @@ fn validate_file<'a>(
             file.path
         )));
     }
-    if file.sha256.len() != 64 || !file.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !is_hex64(&file.sha256) {
         return Err(ArkError::Manifest(format!(
             "file `{}`: sha256 must be 64 hex characters",
             file.path
         )));
     }
     Ok(())
+}
+
+/// `<prefix><64 hex>` — a well-formed digest, not just a prefix.
+fn has_digest(value: &str, prefix: &str) -> bool {
+    value.strip_prefix(prefix).is_some_and(is_hex64)
+}
+
+fn is_hex64(digest: &str) -> bool {
+    digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn check_relative_path(object: &str, path: &str) -> Result<()> {
@@ -386,6 +395,14 @@ mod tests {
         let mut m = manifest(vec![object("a", &[])]);
         m.objects[0].schema_hash = "md5:x".into();
         assert!(m.validate().is_err());
+        // A prefix alone, or a prefix with a non-digest, is not a hash.
+        m.objects[0].schema_hash = "sha256:".into();
+        assert!(m.validate().is_err());
+        m.objects[0].schema_hash = format!("sha256:{}", "0".repeat(64));
+        m.objects[0].content_hash = Some("sum256:not-a-digest".into());
+        assert!(m.validate().is_err());
+        m.objects[0].content_hash = Some(format!("sum256:{}", "a".repeat(64)));
+        assert!(m.validate().is_ok());
     }
 
     #[test]
@@ -397,6 +414,7 @@ mod tests {
             object("audit", &["orders", "missing.ignored"]),
             object("x", &["y"]),
             object("y", &["x"]),
+            object("self_ref", &["self_ref"]),
         ]);
         let plan = m.load_plan();
         fn names<'a>(layer: &[&'a ObjectEntry]) -> Vec<&'a str> {
@@ -408,6 +426,6 @@ mod tests {
         assert_eq!(names(&plan.layers[1]), vec!["orders"]);
         assert_eq!(names(&plan.layers[2]), vec!["audit"]);
         assert_eq!(plan.layers.len(), 3);
-        assert_eq!(names(&plan.cyclic), vec!["x", "y"]);
+        assert_eq!(names(&plan.cyclic), vec!["self_ref", "x", "y"]);
     }
 }

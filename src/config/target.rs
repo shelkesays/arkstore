@@ -3,6 +3,7 @@
 //! per-field overrides (flag > env > entry > engine default).
 
 use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
 use tracing::warn;
@@ -136,29 +137,31 @@ pub fn resolve_target(
     Ok(resolved)
 }
 
-/// Stage one: which `targets` entry — `--target` > env > the source's name;
-/// else the inline `restore.target`.
+/// Stage one: which `targets` entry — `--target` > env > the source's name.
+/// The inline `restore.target` is a fallback **only when no name was given
+/// explicitly**: a misspelled `--target` must fail, never silently pick
+/// another target.
 fn select_entry<'c>(
     config: &'c Config,
     source: &Source,
     overrides: &TargetOverrides,
     env: &dyn EnvLookup,
 ) -> Result<&'c Target> {
-    let entry_name = overrides
-        .target
-        .clone()
-        .or_else(|| env.get(ENV_TARGET))
-        .unwrap_or_else(|| source.name.clone());
-    let entry = config
-        .targets
-        .iter()
-        .find(|t| t.name == entry_name)
-        .or(config.restore.target.as_ref())
-        .ok_or_else(|| {
+    let explicit = overrides.target.clone().or_else(|| env.get(ENV_TARGET));
+    let entry_name = explicit.clone().unwrap_or_else(|| source.name.clone());
+    let entry = match config.targets.iter().find(|t| t.name == entry_name) {
+        Some(entry) => entry,
+        None if explicit.is_some() => {
+            return Err(ArkError::Validation(format!(
+                "no restore target named `{entry_name}` (selected via --target / {ENV_TARGET})"
+            )));
+        }
+        None => config.restore.target.as_ref().ok_or_else(|| {
             ArkError::Validation(format!(
                 "no restore target named `{entry_name}` in `targets`, and no inline `restore.target`"
             ))
-        })?;
+        })?,
+    };
     if entry.target_type != source.source_type {
         return Err(ArkError::Validation(format!(
             "target `{}` is type `{:?}` but source `{}` is `{:?}`",
@@ -204,7 +207,7 @@ fn require_fields(target: &ResolvedTarget) -> Result<()> {
 }
 
 fn is_blank(value: &Option<String>) -> bool {
-    value.as_deref().is_none_or(str::is_empty)
+    value.as_deref().is_none_or(|v| v.trim().is_empty())
 }
 
 /// The never-production guard (PRD §6.2): abort when the target *is* the
@@ -242,16 +245,39 @@ pub fn check_not_production(source: &Source, target: &ResolvedTarget) -> Result<
     Ok(())
 }
 
+/// Whether one directory contains (or equals) the other. Both paths are
+/// normalised the same way — canonicalised (symlinks resolved) when both
+/// exist on this host, otherwise lexically (`.` / `..` collapsed, relative
+/// paths anchored at the current directory) — and compared component-wise,
+/// so `/srv/data/../data` overlaps `/srv/data` and `/srv/data2` does not.
 fn paths_overlap(a: &str, b: &str) -> bool {
-    let norm = |p: &str| p.trim_end_matches(['/', '\\']).to_string();
-    let (a, b) = (norm(a), norm(b));
-    let under = |outer: &str, inner: &str| {
-        inner == outer
-            || inner
-                .strip_prefix(outer)
-                .is_some_and(|rest| rest.starts_with('/') || rest.starts_with('\\'))
+    let (a, b) = (Path::new(a), Path::new(b));
+    let (a, b) = match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => (lexical_normalize(a), lexical_normalize(b)),
     };
-    under(&a, &b) || under(&b, &a)
+    a.starts_with(&b) || b.starts_with(&a)
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let mut out = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::ParentDir => {
+                let _at_root = !out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -378,6 +404,56 @@ mod tests {
             None,
         );
         assert!(resolve_target(&c, &s, &TargetOverrides::default(), &bad).is_err());
+    }
+
+    #[test]
+    fn explicit_unknown_target_errors_instead_of_falling_back() {
+        let c = cfg(
+            "[]",
+            Some("{name: inline, type: postgre, host: h, db: d, user: u}"),
+        );
+        let s = src(SourceType::Postgre);
+        let o = TargetOverrides {
+            target: Some("stagng".into()),
+            ..Default::default()
+        };
+        let none: HashMap<String, String> = HashMap::new();
+        let err = resolve_target(&c, &s, &o, &none).unwrap_err().to_string();
+        assert!(err.contains("stagng"), "{err}");
+        let env: HashMap<String, String> = [(ENV_TARGET.to_string(), "typo".to_string())].into();
+        assert!(resolve_target(&c, &s, &TargetOverrides::default(), &env).is_err());
+    }
+
+    #[test]
+    fn whitespace_only_fields_count_as_missing() {
+        let c = cfg(
+            "- {name: appdb, type: postgre, host: '   ', db: d, user: u}\n",
+            None,
+        );
+        let s = src(SourceType::Postgre);
+        let none: HashMap<String, String> = HashMap::new();
+        let err = resolve_target(&c, &s, &TargetOverrides::default(), &none)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`host`"), "{err}");
+    }
+
+    #[test]
+    fn path_overlap_normalises_dot_dot_and_compares_components() {
+        assert!(paths_overlap("/srv/data", "/srv/data/../data"));
+        assert!(paths_overlap("/srv/data", "/srv/./data/sub/.."));
+        assert!(paths_overlap("/srv/data", "/srv/data/sub"));
+        assert!(paths_overlap("/srv", "/srv/data"));
+        assert!(!paths_overlap("/srv/data", "/srv/data2"));
+        assert!(!paths_overlap("/srv/data", "/srv/data-archive"));
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let alias = real.join("..").join("real");
+        assert!(paths_overlap(
+            &real.to_string_lossy(),
+            &alias.to_string_lossy()
+        ));
     }
 
     #[test]
