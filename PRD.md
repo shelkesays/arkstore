@@ -203,9 +203,14 @@ backup — it is a collection of mutually inconsistent tables. Native dumps must
   exporting transaction lives. (This is the same mechanism `pg_dump -j` uses.)
 - **MySQL/MariaDB** — `START TRANSACTION WITH CONSISTENT SNAPSHOT` at `REPEATABLE READ` on InnoDB.
   MySQL cannot share a snapshot across connections, so the tables of one MySQL source are dumped
-  **sequentially on the snapshot connection** (parallelism stays at the source level). Non-
-  transactional engines (MyISAM) cannot be snapshotted — surfaced as a per-table warning and
-  documented as a limitation.
+  **sequentially on the snapshot connection** (parallelism stays at the source level).
+  Non-transactional engines (MyISAM, MEMORY, …) **cannot participate in the snapshot**, so by
+  default a source containing any such table **fails before reading any data** — the same rule as
+  a snapshot that cannot be established — naming the offending tables. A source may opt in with
+  `allow_unsnapshotted_tables: true`: those tables are then dumped outside the snapshot, the
+  manifest marks each with `consistency: "none"` and the archive as a whole with
+  `consistent: false`, restore and `verify` surface that flag, and a warning is logged per table.
+  Nothing about this path is silent.
 - **MongoDB** — there is **no cross-collection snapshot** without the oplog. v1 dumps each
   collection with a single cursor; cross-collection point-in-time consistency is out of scope and
   stated plainly in the docs (an oplog-based mode is a roadmap item, §15).
@@ -552,10 +557,17 @@ Verification proves a backup is restorable — the safety net that makes native 
     — `CREATEDB` on Postgres, `CREATE` on MySQL, `dbAdmin` on Mongo) it creates a database named
     `arkstore_verify_<source>_<stamp>`, restores into it, and **always drops it** at the end —
     on success, failure, or interrupt. It never drops a database it did not create.
-- **Compare** the result against the **manifest baseline** captured at dump time (§6.1): every
-  expected object exists; per-object row/document counts match; for SQL engines the per-table
-  **order-independent content hash** matches the value recorded in the snapshot; for Mongo, document
-  counts and index definitions match.
+- **Compare** the result against the **manifest baseline** captured at dump time (§6.1) on
+  **both** axes of the fidelity contract (§5.1.2):
+  - **Schema / metadata** — every expected object exists **and its definition matches**: the
+    restored target is re-introspected through the same catalog reader the dump used, each
+    object's definition is canonicalised, and its `schema_hash` is compared with the manifest's.
+    This covers columns/types/defaults, constraints (PK/unique/FK/check/exclusion), indexes,
+    sequence definitions **and current values**, views/matviews, functions, triggers, types,
+    extensions, partitioning, comments — and for Mongo, index definitions and collection options.
+    A lost constraint, index, or trigger therefore **fails** verification.
+  - **Data** — per-object row/document counts match; for SQL tables the **order-independent
+    content hash** matches the value recorded in the snapshot.
 - **Report** `{verified, mismatched, failed}` per object with reasons; exit `1` on any mismatch.
 - **Tear down** the throwaway target only if Arkstore created it; never touch a pre-existing one.
 
@@ -581,7 +593,8 @@ Three declarative layers:
    (`host`, `port`, `user`, password-via-secret, optional TLS settings), and per source:
    `structure`, `data`, `ignore_startswith`, `ignore`, `include_privileges` (Postgres/MySQL,
    default `false` — §5.1.2), `copy_format` (Postgres, `text` | `binary`, default `text` —
-   §5.1.3), `backup_to_s3`, `delete_after_upload`, `local_retention`, and optional `archive` rules
+   §5.1.3), `allow_unsnapshotted_tables` (MySQL, default `false` — §5.1.1), `backup_to_s3`,
+   `delete_after_upload`, `local_retention`, and optional `archive` rules
    (block-YAML style). File sources add `path`, `ignore_extensions`. Mongo
    adds `authentication_database` (defaults to the db name).
 3. **Targets** (`targets.yaml`, optional): named restore targets — DBs `name`, `host`, `db`,
@@ -885,10 +898,11 @@ These are deliberate choices baked into the requirements above. They are recorde
     real deployments need "keep the shape of this table but not its (huge/sensitive/transient) rows"
     without losing the schema — a single exclude list can't express that.
 
-11. **One consistent snapshot per source.** A backup reads every object of a source at a single
+11. **One consistent snapshot per source.** A backup of a SQL source reads every object at a single
     transactional point in time (`REPEATABLE READ` + `pg_export_snapshot()` / `WITH CONSISTENT
-    SNAPSHOT` — §5.1.1), and a dump that cannot establish its snapshot fails before reading
-    anything. Rationale: a set of per-table reads taken at different moments is not a backup of the
+    SNAPSHOT` — §5.1.1). A source that cannot establish its snapshot — or contains tables that
+    cannot join it — fails before reading anything unless explicitly opted in, and the manifest
+    records the outcome either way. MongoDB is per-collection in v1 (§5.1.1): stated, not hidden. Rationale: a set of per-table reads taken at different moments is not a backup of the
     database — it is a collection of mutually inconsistent tables that may violate every foreign
     key on restore. Consistency is the property that makes a dump restorable, so it is a hard
     requirement, not an optimization.
