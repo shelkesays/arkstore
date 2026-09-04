@@ -149,10 +149,13 @@ Everything those tools do is therefore reimplementable. What they *guarantee* th
 lacks — **consistency** and **fidelity** — becomes an explicit requirement here (§5.1.1, §5.1.2)
 rather than something inherited by shelling out.
 
-**Drivers (pure Rust, no C, statically linkable):** Postgres — `tokio-postgres` (or `sqlx`'s native
-Postgres driver), which implements `COPY … TO STDOUT` / `COPY … FROM STDIN`; MySQL — `mysql_async`
-(or `sqlx` MySQL); MongoDB — the official `mongodb` crate with `bson`. TLS via `rustls`, never
-OpenSSL, so the musl static build stays free of system libraries.
+**Drivers (pure Rust, no C, statically linkable):** Postgres — `tokio-postgres` (`copy_in` /
+`copy_out`) or `sqlx`'s native Postgres driver (`copy_in_raw` / `copy_out_raw`); MySQL —
+`mysql_async` (or `sqlx` MySQL); MongoDB — the official `mongodb` crate with `bson`. TLS via
+`rustls`, never OpenSSL, so the musl static build stays free of system libraries — concretely:
+`tokio-postgres-rustls` (`MakeRustlsConnect`, MIT) for Postgres; `mysql_async`'s `rustls-tls`
+feature (it enables **no** TLS backend by default, so this must be selected explicitly); and
+`mongodb`'s default `rustls-tls` feature (OpenSSL is opt-in there and never chosen).
 
 #### 5.1.1 Consistency: one snapshot per source (required)
 
@@ -164,7 +167,11 @@ backup — it is a collection of mutually inconsistent tables. Native dumps must
 - **PostgreSQL** — open one `REPEATABLE READ` read-only transaction for the whole source and read
   every catalog and table inside it. When tables are dumped **in parallel**, export that
   transaction's snapshot with `pg_export_snapshot()` and have every worker connection adopt it via
-  `SET TRANSACTION SNAPSHOT`, so all workers see the identical point in time.
+  `SET TRANSACTION SNAPSHOT`, so all workers see the identical point in time. Two rules the server
+  imposes: each worker's transaction must itself be `REPEATABLE READ` (or `SERIALIZABLE`) with
+  `SET TRANSACTION SNAPSHOT` as its **first** statement, and the **leader transaction must stay
+  open** until the last worker finishes — an exported snapshot is importable only while the
+  exporting transaction lives. (This is the same mechanism `pg_dump -j` uses.)
 - **MySQL/MariaDB** — `START TRANSACTION WITH CONSISTENT SNAPSHOT` at `REPEATABLE READ` on InnoDB.
   MySQL cannot share a snapshot across connections, so the tables of one MySQL source are dumped
   **sequentially on the snapshot connection** (parallelism stays at the source level). Non-
@@ -877,7 +884,9 @@ These are deliberate choices baked into the requirements above. They are recorde
   backends (§5.1); file sources; `verify` extended to each engine.
 - **M4 — Distribution:** prebuilt releases, container image (binary only), docs site.
 - **M5 — Extensions:** client-side encryption; additional object stores (GCS/Azure); oplog-based
-  point-in-time consistency for MongoDB; Postgres large objects.
+  point-in-time consistency for MongoDB; Postgres large objects; optional `pg_dump`
+  custom-format output (via `libpgdump`, BSD-3-Clause) so stock `pg_restore` can consume Arkstore
+  archives.
 
 ---
 
@@ -890,8 +899,20 @@ These are deliberate choices baked into the requirements above. They are recorde
    versions and architectures match?
 5. `tokio-postgres` vs `sqlx` as the Postgres driver (both pure Rust, both support `COPY`) — the
    choice decides whether one driver stack (`sqlx`) can serve Postgres and MySQL together.
-
 **Resolved (now specified above):**
+- *Reuse vs. build for the Postgres schema dump* — **build.** A crates.io survey (2026-09) found no
+  pure-Rust crate usable as a dependency: `pg_dbmigrator` shells out to `pg_dump`/`pg_restore` (per
+  its own README) — the very thing being avoided; `elefant-tools`/`elefant-sync` is the one genuine
+  pure-Rust wire-protocol implementation, but it carries **no license** (none on crates.io, no
+  `LICENSE` in its repository — unusable as a dependency), is self-described experimental (`0.0.8`),
+  explicitly does **not** run in one transaction (no snapshot consistency, §5.1.1), rides a `0.1`
+  custom driver (`elefant-client`, COPY support undocumented), and lacks exclusion constraints,
+  collations, and RLS from the fidelity contract (§5.1.2). It remains the best public *reference*
+  for catalog→DDL behaviour, and its "not supported" list is a useful checklist of hard cases.
+  `pgpushy-core` parses DDL source files via `libpg_query` (C) rather than introspecting a catalog —
+  not applicable. `libpgdump` (BSD-3-Clause) reads/writes `pg_dump` custom/directory/tar archives
+  without a server: not a dumper, but a viable path to emitting `pg_restore`-compatible archives
+  (roadmap, §15). No longer open.
 - *Dump mechanism* — fully native wire-protocol backends for every engine; no external client
   tools and no `dump_strategy` knob (§5.1, §13.7). No longer open.
 - *`verify` operation* — in scope as a core operation from M0 (§6.5). No longer open.
