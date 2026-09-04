@@ -259,9 +259,14 @@ correctness-sensitive operation: preview-first, target-guarded, integrity-checke
    before any transfer) — except a local single-dump restore.
 4. Resolve `--from` → download → **safe-extract** (§8/PRD §9.6).
 5. **Validate against `manifest.json`** — each expected file present, `sha256`/size
-   match. A missing/mismatched **structure** file is non-fatal (fall back to
-   parsing the data file); a missing/corrupt **data** file drops that object and
-   counts as a failure.
+   match. A missing/corrupt **data** file drops that object and counts as a
+   failure. A missing/mismatched **structure** file is non-fatal **only when the
+   schema is otherwise available** — the data file is self-describing (carries its
+   own DDL, as a full per-table dump does) *or* the target already defines the
+   object; then the restorer falls back to deriving FK order (§5.5) from the data
+   file. A genuinely **data-only** object with no schema in the target and no DDL
+   in the data file **fails** (recorded, skipped) — never load data into a
+   non-existent table. (See the data-only note in §5.7.)
 6. **Compute load order** (§5.5).
 7. **Load** per layer, then verify object presence. Per-object failure isolation:
    a failed object is recorded + skipped, never aborting the run.
@@ -288,11 +293,16 @@ blocks are untouched:
 **Retry-with-fallback:** if a permission error blocks disabling constraint triggers
 (`session_replication_role = replica`), retry the load once without it.
 
-### 5.7 Structure-only & single-item restore
+### 5.7 Structure-only, data-only & single-item restore
 
 - **Structure-only** — an object backed up structure-only (or in the data-skip
   `ignore` set, §2.3) is **recreated empty** from its structure file when no data
   file is present.
+- **Data-only** — an object backed up data-only (`structure: false`) carries no
+  DDL, so its **schema must already exist in the target** (or be recreated by a
+  prior structure restore / migration). Restoring data-only into a target that
+  lacks the object **fails that object** (§5.4 step 5) — the loader never
+  fabricates a schema or writes rows to a non-existent table.
 - **Single-item** — a local single dump (`.sql` / engine archive) restores on its
   own; the target object must be **absent or empty** first. (Single-item **file**
   restore is unsupported — file restores use the full-tree path.)
