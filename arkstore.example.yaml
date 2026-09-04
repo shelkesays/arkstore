@@ -6,6 +6,11 @@ app:
   timezone: Asia/Kolkata      # IANA name; all calendar decisions use this
   log_level: info             # error | warn | info | debug | trace
 
+secrets:
+  # Local secrets file (dev / self-hosted), keyed by source / target name.
+  # Overridden by ARKSTORE_SECRETS_FILE. Never commit the real one.
+  # file: arkstore_secrets.yaml
+
 aws:
   bucket: my-backups-bucket
   region: ap-south-1
@@ -42,20 +47,62 @@ archive:
   compression: snappy
   fetch_batch_size: 50000
 
+# Sources may live here or in a sibling `sources.yaml` (used when this list is
+# empty). Per-source options (defaults shown) — see docs/knowledge-base.md §6.2.
 sources:
-  - name: appdb
+  - name: appdb               # 1-64 chars: letters/digits/_ . -, ASCII only
     type: postgre             # postgre | mysql | mongo | file
     enable: true
     host: db.internal
     port: 5432
+    # database: appdb         # defaults to the source name
     user: backup
     # password: <from secrets>
+    tls: prefer               # disable | prefer | require | verify-full
+    # tls_ca_file: /etc/ssl/certs/ca.pem
+    structure: true           # dump DDL (mongo defaults to false)
+    data: true                # dump rows / documents
+    # ignore_startswith: [pg_, rds_, awsdms_]   # excluded outright (engine defaults)
+    # ignore: []              # postgre: data skipped, structure kept; others: excluded
+    include_privileges: false # emit OWNER TO / GRANT (postgre, mysql)
+    copy_format: text         # postgre only: text | binary (opt-in)
+    backup_to_s3: true
+    delete_after_upload: true
+    local_retention: 0        # keep newest N local archives; 0 = disabled
     archive:
       - table: logs
         time_column: dttm
         retention_days: 90
 
+  - name: docs
+    type: mongo
+    enable: false
+    host: mongo.internal
+    user: backup
+    # authentication_database: admin   # defaults to the database name
+
   - name: config-files
     type: file
     enable: true
     path: /etc/myapp
+
+# Restore / verify targets may live here or in a sibling `targets.yaml`.
+# Selected by --target > ARKSTORE_TARGET > the source's own name; each field
+# then resolves flag > env > entry > engine default. The password is never a
+# flag: ARKSTORE_TARGET_PASSWORD, the secrets file, or a TTY prompt.
+targets:
+  - name: appdb               # same name as the source = its default target
+    type: postgre
+    host: staging.internal
+    db: appdb
+    user: restore
+    ephemeral: false          # true = verify may use it as-is (never dropped)
+
+# Inline fallback when no `targets` entry matches.
+# restore:
+#   target: {name: scratch, type: postgre, host: scratch.internal, db: scratch, user: restore}
+
+# Server on which `verify` may CREATE a throwaway database
+# (arkstore_verify_<source>_<stamp>), always dropped afterwards.
+# verify:
+#   server: {name: verify-host, type: postgre, host: scratch.internal, user: verify_admin}

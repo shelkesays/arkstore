@@ -9,7 +9,7 @@ use crate::error::Result;
 /// Archive every enabled, archivable source that declares archive rules.
 ///
 /// Sources with no rules are logged and skipped. Returns failed source names.
-pub fn run(config: &Config, only: Option<&str>, dry_run: bool) -> Result<Vec<String>> {
+pub async fn run(config: &Config, only: Option<&str>, dry_run: bool) -> Result<Vec<String>> {
     if !config.archive.enable {
         warn!("archive is disabled in config");
         return Ok(vec![]);
@@ -17,7 +17,7 @@ pub fn run(config: &Config, only: Option<&str>, dry_run: bool) -> Result<Vec<Str
     let dry_run = dry_run || config.archive.dry_run;
 
     let mut failed = Vec::new();
-    for source in config.selected_sources(only) {
+    for source in config.selected_sources(None, only) {
         if !source.source_type.is_archivable() {
             continue;
         }

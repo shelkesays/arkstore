@@ -21,7 +21,7 @@ pub enum CleanupAction {
 }
 
 /// Run the requested cleanup action. Returns failed item names (empty = clean).
-pub fn run(
+pub async fn run(
     config: &Config,
     action: CleanupAction,
     only: Option<&str>,

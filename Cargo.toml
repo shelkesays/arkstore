@@ -12,17 +12,27 @@ keywords = ["backup", "restore", "archive", "s3", "database"]
 categories = ["command-line-utilities", "database"]
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+chrono-tz = "0.10"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 serde_yaml = "0.9"
+sha2 = "0.10"
 thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# chrono / chrono-tz return when timezone-aware retention/archive logic lands (M1/M2).
+zeroize = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [features]
 # A sensible default build: Postgres + file sources + Parquet archival.
 default = ["postgres", "archive", "files"]
+# Engine drivers become optional dependencies behind these features as each
+# backend lands (M0-3: tokio-postgres; M3: mysql_async, mongodb).
 postgres = []
 mysql = []
 mongo = []
