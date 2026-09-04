@@ -3,7 +3,7 @@
 use std::process::ExitCode;
 
 use clap::Parser;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 use tracing_subscriber::EnvFilter;
 
 use arkstore::cli::{Cli, Command};
@@ -16,6 +16,7 @@ use arkstore::secrets;
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     init_tracing(cli.log_level.as_deref());
+    install_crypto_provider();
 
     // Ctrl-C cancels in-flight work cooperatively; ops clean up via Drop
     // guards and the process exits 130 (PRD §9.6).
@@ -96,6 +97,17 @@ async fn run(cli: &Cli) -> arkstore::Result<Vec<String>> {
             };
             ops::verify(&config, &request, *dry_run).await
         }
+    }
+}
+
+/// rustls is built without a bundled provider (so the S3 client links `ring`,
+/// not aws-lc-rs); make `ring` the process default before any TLS handshake.
+fn install_crypto_provider() {
+    if rustls::crypto::ring::default_provider()
+        .install_default()
+        .is_err()
+    {
+        debug!("rustls crypto provider was already installed");
     }
 }
 

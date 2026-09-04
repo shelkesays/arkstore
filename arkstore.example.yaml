@@ -5,6 +5,7 @@
 app:
   timezone: Asia/Kolkata      # IANA name; all calendar decisions use this
   log_level: info             # error | warn | info | debug | trace
+  local_dir: arkstore-local   # local copies of finished backups (mirrors the S3 layout)
 
 secrets:
   # Local secrets file (dev / self-hosted), keyed by source / target name.

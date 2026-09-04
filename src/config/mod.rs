@@ -56,6 +56,15 @@ pub struct AppConfig {
     /// Default log level when neither `--log-level` nor `RUST_LOG` is set.
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    /// Where local copies of finished backups live (`<local_dir>/<source>/…`,
+    /// mirroring the S3 layout) when a source is local-only or keeps copies
+    /// after upload. Scratch work happens in temp dirs, not here.
+    #[serde(default = "default_local_dir")]
+    pub local_dir: PathBuf,
+}
+
+fn default_local_dir() -> PathBuf {
+    PathBuf::from("arkstore-local")
 }
 
 fn default_timezone() -> String {
@@ -71,6 +80,7 @@ impl Default for AppConfig {
         Self {
             timezone: default_timezone(),
             log_level: default_log_level(),
+            local_dir: default_local_dir(),
         }
     }
 }
