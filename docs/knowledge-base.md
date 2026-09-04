@@ -120,6 +120,7 @@ The manifest is the archive's authority on what it contains (§5.4). Version 1:
   "stamp": "2026-09-04-074507",
   "timezone": "UTC",
   "snapshot": { "kind": "pg_snapshot", "id": "00000003-00000002-1" },
+  "consistent": true,
   "session": {
     "DateStyle": "ISO, YMD", "IntervalStyle": "postgres", "extra_float_digits": "3",
     "bytea_output": "hex", "TimeZone": "UTC", "client_encoding": "UTF8",
@@ -132,6 +133,8 @@ The manifest is the archive's authority on what it contains (§5.4). Version 1:
       "depends_on": ["public.customers"],
       "row_count": 12345,
       "content_hash": "sum256:9f2c…64 hex…",
+      "schema_hash": "sha256:4b1e…64 hex…",
+      "consistency": "snapshot",
       "files": [
         { "path": "public.orders.schema.sql", "role": "structure", "size": 812,   "sha256": "…" },
         { "path": "public.orders.data.copy",  "role": "data",      "size": 90211, "sha256": "…" }
@@ -149,12 +152,15 @@ The manifest is the archive's authority on what it contains (§5.4). Version 1:
 | `created_at` | RFC 3339 UTC | Wall-clock at snapshot open. |
 | `stamp`, `timezone` | string | The key stamp (§1) and the `app.timezone` it was rendered in. |
 | `snapshot` | object | `{kind, id}` — `pg_snapshot` + exported id; `mysql_consistent` + `null`; `mongo_none` + `null`. |
+| `consistent` | bool | `true` iff every object was read inside the source snapshot. `false` only via `allow_unsnapshotted_tables` (§11.1); surfaced by restore and `verify`. |
 | `session` | object | The pinned session settings the data was encoded under (§11.3); empty for Mongo. |
 | `objects[].name` | string | Schema-qualified (`schema.object`) or `db.collection`. |
 | `objects[].kind` | enum | `table` \| `view` \| `matview` \| `sequence` \| `function` \| `trigger` \| `type` \| `extension` \| `collection` \| `mongo_view`. |
 | `objects[].depends_on` | string[] | Names this object must be created/loaded **after** (FK parents, base relations, referenced types). Drives §5.5. |
 | `objects[].row_count` | int \| null | Rows/documents in the snapshot; `null` for kinds without data. |
 | `objects[].content_hash` | string \| null | `sum256:<64 hex>` (§11.3); SQL tables only. |
+| `objects[].schema_hash` | string | `sha256:<64 hex>` of the object's **canonicalised definition** (emitted DDL / index+option metadata with volatile parts — OIDs, whitespace, ownership — normalised). `verify` (§12) recomputes it from the restored target. |
+| `objects[].consistency` | enum | `snapshot` (read inside the source snapshot) \| `none` (MySQL non-transactional table, opt-in only) \| `per_collection` (Mongo v1). |
 | `objects[].files[]` | object[] | `{path, role, size, sha256}`; `role` ∈ `structure` \| `data` \| `metadata`; `path` relative to the archive root, no `..`, no leading `/`. |
 
 Rules: every file in the tar **must** appear in `objects[].files` — a file present in the archive but
@@ -439,6 +445,7 @@ defaults:
 | `local_retention` | all | `0` (disabled) |
 | `include_privileges` | postgre/mysql | `false` (§11.2) |
 | `copy_format` | postgre | `text` (`binary` opt-in — §11.3) |
+| `allow_unsnapshotted_tables` | mysql | `false` (§11.1) |
 | `archive` | DB | `[]` (rules `{table, time_column, retention_days?}`) |
 | `path` | file | — (required) |
 | `authentication_database` | mongo | source `name` |
@@ -660,8 +667,13 @@ Rust counterpart of Python install extras, resolved at build time (PRD §5).
 | MySQL/MariaDB | `START TRANSACTION WITH CONSISTENT SNAPSHOT` at `REPEATABLE READ` (InnoDB) | not shareable across connections — tables are dumped **sequentially on the snapshot connection**; parallelism stays at the source level (`max_sources`) |
 | MongoDB | single cursor per collection; **no cross-collection snapshot** without the oplog (stated in docs; oplog mode is roadmap) | — |
 
-Non-transactional MySQL engines (MyISAM) cannot be snapshotted → per-table
-warning. A source whose snapshot cannot be established **fails before any read**.
+A source whose snapshot cannot be established **fails before any read**. The same
+rule applies to tables that cannot *join* it: non-transactional MySQL engines
+(MyISAM, MEMORY, …) fail the source by default, naming the tables. Opt-in
+`allow_unsnapshotted_tables: true` dumps them outside the snapshot with
+`objects[].consistency = "none"` and top-level `consistent: false` in the
+manifest (§2.5), a warning per table, and the flag surfaced by restore and
+`verify`. Never silent.
 
 ### 11.2 Fidelity contract (what "full fidelity" means)
 
@@ -741,9 +753,15 @@ MySQL 8.0+ / MariaDB 10.6+, MongoDB 5.0+ — widened only as the fidelity suite
    create rights: `CREATEDB` / `CREATE` / `dbAdmin`): database
    `arkstore_verify_<source>_<stamp>`, restored into, then **always dropped** —
    on success, failure, or interrupt. Never drops a database it did not create.
-3. Compare against the **manifest baseline** (§2.1): every expected object
-   exists; row/document counts match; SQL per-table **order-independent content
-   hash** matches; Mongo index definitions match.
+3. Compare against the **manifest baseline** (§2.5) on both axes:
+   - **schema/metadata** — re-introspect the target with the dump's catalog
+     reader, canonicalise each object's definition, compare `schema_hash`
+     (columns, constraints incl. FK/check/exclusion, indexes, sequence
+     definitions + current values, views/matviews, functions, triggers, types,
+     extensions, partitioning, comments; Mongo indexes + collection options). A
+     lost constraint/index/trigger fails.
+   - **data** — row/document counts match; SQL per-table **order-independent
+     content hash** matches.
 4. Report `{verified, mismatched, failed}` per object with reasons; exit `1` on
    any mismatch.
 5. Tear down only a target Arkstore created; never touch a pre-existing one.
