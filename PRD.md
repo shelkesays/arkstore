@@ -900,19 +900,37 @@ These are deliberate choices baked into the requirements above. They are recorde
 5. `tokio-postgres` vs `sqlx` as the Postgres driver (both pure Rust, both support `COPY`) — the
    choice decides whether one driver stack (`sqlx`) can serve Postgres and MySQL together.
 **Resolved (now specified above):**
-- *Reuse vs. build for the Postgres schema dump* — **build.** A crates.io survey (2026-09) found no
-  pure-Rust crate usable as a dependency: `pg_dbmigrator` shells out to `pg_dump`/`pg_restore` (per
-  its own README) — the very thing being avoided; `elefant-tools`/`elefant-sync` is the one genuine
-  pure-Rust wire-protocol implementation, but it carries **no license** (none on crates.io, no
-  `LICENSE` in its repository — unusable as a dependency), is self-described experimental (`0.0.8`),
-  explicitly does **not** run in one transaction (no snapshot consistency, §5.1.1), rides a `0.1`
-  custom driver (`elefant-client`, COPY support undocumented), and lacks exclusion constraints,
-  collations, and RLS from the fidelity contract (§5.1.2). It remains the best public *reference*
-  for catalog→DDL behaviour, and its "not supported" list is a useful checklist of hard cases.
-  `pgpushy-core` parses DDL source files via `libpg_query` (C) rather than introspecting a catalog —
-  not applicable. `libpgdump` (BSD-3-Clause) reads/writes `pg_dump` custom/directory/tar archives
-  without a server: not a dumper, but a viable path to emitting `pg_restore`-compatible archives
-  (roadmap, §15). No longer open.
+- *Reuse vs. build for the Postgres schema dump* — **build, on a mature driver.** A survey of
+  crates.io and GitHub (2026-09; source read at pinned commits) found no permissively-licensed,
+  pure-Rust crate a correctness-first tool can depend on for a snapshot-consistent logical dump:
+  - `pg_dbmigrator` — shells out to `pg_dump`/`pg_restore` (its own README): the very thing being
+    avoided.
+  - `elefant-tools` / `elefant-sync` (on its own `elefant-client` driver) — the one genuine
+    pure-Rust implementation of the *whole* job: catalog→DDL, `COPY TO STDOUT` data, and a
+    **snapshot-consistent parallel dump** (leader `REPEATABLE READ` + `pg_export_snapshot()`,
+    workers `SET TRANSACTION SNAPSHOT` — exactly §5.1.1). Blockers: MIT is *declared* (`Cargo.toml`
+    and crates.io) but there is **no `LICENSE` text and no copyright notice anywhere in 326
+    commits** — an ambiguity to resolve upstream before it could be a dependency; self-described
+    experimental (`0.0.8`); RLS, collations, exclusion constraints, and roles unsupported (gaps
+    against §5.1.2); its driver is `0.1.0`, ~10 % documented, with no pipelining, no connection-URL
+    parsing, and no `sslmode=verify-full` semantics (`Prefer` silently downgrades to plaintext).
+    **Decision:** not a dependency — the wire layer is the commodity where maturity matters most, so
+    Arkstore uses `tokio-postgres`/`sqlx` (§5.1) — but the best public *reference* for catalog→DDL
+    and parallel-snapshot orchestration; its "unsupported" list is a ready checklist of hard cases.
+  - `pg_plumbing` (GitHub only, not on crates.io) — pure Rust on `tokio-postgres`; broad coverage
+    incl. RLS, privileges, FDWs; writes real `PGDMP` custom/directory/tar archives. But it reads
+    data with `SELECT … ::text` into an in-memory `Vec<Row>` (no `COPY`, unbounded memory) and has
+    **no transaction, no `REPEATABLE READ`, no `pg_export_snapshot`** in its dump path — not
+    snapshot-consistent by construction; license conflicted (`Cargo.toml` MIT vs. a root
+    Apache-2.0 `LICENSE`); "early development". A second catalog-query reference only.
+  - `declarative-postgres-migrate` — clean MIT (declared + `LICENSE` file); live catalog
+    introspection over `sqlx` (rustls) emitting DDL; but no data path, no snapshot, and no
+    matviews/RLS/domains/collations/privileges. A schema-convergence engine, not a backup path.
+  - `pgpushy-core` — parses DDL *source files* via `libpg_query` (C); not catalog introspection.
+  - `libpgdump` (BSD-3-Clause, `LICENSE` present) — reads/writes `pg_dump` custom/directory/tar
+    archives without a server: not a dumper, but the path to `pg_restore`-compatible output
+    (roadmap, §15).
+  No longer open.
 - *Dump mechanism* — fully native wire-protocol backends for every engine; no external client
   tools and no `dump_strategy` knob (§5.1, §13.7). No longer open.
 - *`verify` operation* — in scope as a core operation from M0 (§6.5). No longer open.
