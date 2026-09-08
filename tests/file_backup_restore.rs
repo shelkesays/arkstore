@@ -8,7 +8,7 @@ use std::path::Path;
 use arkstore::cli::RestoreAction;
 use arkstore::config::{Config, TargetOverrides};
 use arkstore::error::ArkError;
-use arkstore::layout::{latest_key, parse_key, BackupKind};
+use arkstore::layout::{latest_key, parse_key, versioned_key, BackupKind};
 use arkstore::ops::{backup, restore, RestoreRequest};
 use arkstore::store::Store;
 
@@ -191,4 +191,104 @@ async fn database_sources_report_missing_backend_without_aborting_the_run() {
         store.list("dbbackup/files/versioned/").await.unwrap().len(),
         1
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn restore_refuses_a_symlinked_target_even_if_it_points_at_an_empty_dir() {
+    let base = tempfile::tempdir().unwrap();
+    let (config, store, _stamp) = seed(base.path()).await.unwrap();
+    let outside = base.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    let link = base.path().join("dst-link");
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+    let request = restore_request("latest", Some(&link));
+    let err = restore::run_with_store(&config, &store, &request, false)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("symlink"), "{err}");
+    assert!(fs::read_dir(&outside).unwrap().next().is_none());
+}
+
+/// An archive with one escaping member and one good one, at `path`.
+fn write_tampered_archive(path: &Path) -> std::io::Result<()> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    let file = fs::File::create(path)?;
+    let mut b = tar::Builder::new(GzEncoder::new(file, Compression::default()));
+    let mut h = tar::Header::new_gnu();
+    h.set_size(4);
+    h.set_entry_type(tar::EntryType::Regular);
+    if let Some(gnu) = h.as_gnu_mut() {
+        gnu.name[..8].copy_from_slice(b"../evil\0");
+    }
+    h.set_cksum();
+    b.append(&h, &b"pwnd"[..])?;
+    let mut h = tar::Header::new_gnu();
+    h.set_size(2);
+    h.set_entry_type(tar::EntryType::Regular);
+    h.set_path("ok.txt")?;
+    h.set_cksum();
+    b.append(&h, &b"ok"[..])?;
+    b.into_inner()?.finish()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn restore_fails_when_any_archive_entry_is_refused() {
+    let base = tempfile::tempdir().unwrap();
+    let (config, store, _stamp) = seed(base.path()).await.unwrap();
+    let tampered = base.path().join("tampered.tar.gz");
+    write_tampered_archive(&tampered).unwrap();
+    let stamp = "2026-01-01-000000";
+    store
+        .upload_file(&versioned_key("dbbackup", "files", stamp), &tampered)
+        .await
+        .unwrap();
+
+    let dest = base.path().join("dst-tampered");
+    let request = restore_request(stamp, Some(&dest));
+    let err = restore::run_with_store(&config, &store, &request, false)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("incomplete") && err.contains("1 archive entries"),
+        "{err}"
+    );
+    assert!(
+        dest.join("ok.txt").is_file(),
+        "good entries stay for inspection"
+    );
+    assert!(!base.path().join("evil").exists());
+}
+
+#[tokio::test]
+async fn backup_never_overwrites_an_existing_versioned_key() {
+    let base = tempfile::tempdir().unwrap();
+    let (config, store, first) = seed(base.path()).await.unwrap();
+    // Immediately back up again: either the clock moved to a new second (two
+    // distinct keys) or it did not, in which case the run must be refused.
+    let failed = backup::run_with_store(&config, Some(&store), None, None, false)
+        .await
+        .unwrap();
+    let versioned = store.list("dbbackup/files/versioned/").await.unwrap();
+    let stamps: Vec<String> = versioned
+        .iter()
+        .filter_map(|o| parse_key("dbbackup", &o.key))
+        .filter_map(|p| match p.kind {
+            BackupKind::Versioned { stamp } => Some(stamp),
+            BackupKind::Latest => None,
+        })
+        .collect();
+    if stamps.len() == 1 {
+        assert_eq!(stamps[0], first);
+        assert_eq!(failed.len(), 1, "same-second rerun must be refused");
+        assert!(failed[0].contains("files"), "{failed:?}");
+    } else {
+        assert_eq!(stamps.len(), 2, "{stamps:?}");
+        assert!(failed.is_empty(), "{failed:?}");
+    }
 }

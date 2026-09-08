@@ -24,6 +24,8 @@ says *exactly how*.
 
 - `<stamp>` is a sortable timestamp (`YYYY-MM-DD-HHMMSS`) in `app.timezone`.
 - The `latest` pointer is the **only** mutable object; versioned objects are never overwritten.
+  A stamp collision (rerun within the same second, or the repeated DST fall-back hour in a
+  DST-observing `app.timezone`) fails that backup instead of replacing the object.
 
 **Archives** live under `archive.s3_prefix`, a **sibling top-level prefix outside
 `aws.folder`** so cleanup never sees them:
@@ -423,7 +425,9 @@ Three declarative layers (PRD §7). See [`arkstore.example.yaml`](../arkstore.ex
   e.g. rotate at midnight, keep N files), `error-reporting` (Sentry-style, off),
   `collector` (JSON/Loki/Alloy shipping, off). Endpoints may arrive via the secret.
 - `aws` — `enable`, `region`, credentials **or** instance-role, `bucket`,
-  `folder`, S3-compatible `endpoint`.
+  `folder`, S3-compatible `endpoint`, `checksum` (`sha256` default — every
+  uploaded part carries a server-verified SHA-256; `none` only for stores that
+  reject the header).
 - `cleanup` — `retention.{daily,weekly,monthly,yearly}`, `plans_prefix`,
   `delete_batch_size` (≤1000), `dry_run`, `consolidate_plans`.
 - `archive` — `format`, `s3_prefix`, `default_retention_days`, `whole_months`,
@@ -550,7 +554,8 @@ requirements (PRD §9.6):
 
 - **Safe extraction** — reject path traversal (`..`, absolute), escaping
   symlinks/hardlinks and special members; extract data members only; never write
-  outside the temp dir.
+  outside the temp dir. A refused member **fails** the restore (target left for
+  inspection); a file-restore target must be a real directory, never a symlink.
 - **Object-key / plan-path confinement** — restore keys confined under the
   source prefix; persisted-plan paths resolved under `plans_prefix`; reject `..`
   and rooted paths.

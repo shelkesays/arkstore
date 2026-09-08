@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::cli::RestoreAction;
 use crate::config::{
@@ -17,7 +17,7 @@ use crate::error::{ArkError, Result};
 use crate::layout::{
     latest_key, parse_key, parse_stamp, source_prefix, versioned_key, versioned_prefix, BackupKind,
 };
-use crate::pack::{ensure_headroom, unpack};
+use crate::pack::{ensure_headroom, unpack, UnpackReport};
 use crate::store::{ObjectInfo, Store};
 
 /// What the user asked `restore` to do.
@@ -94,8 +94,10 @@ enum BackupSelection {
     LocalFile(PathBuf),
 }
 
-/// Resolve `--from`: `latest`, a stamp, a local archive path, or a full key
-/// that must stay under the source's own prefix (PRD §9.6 confinement).
+/// Resolve `--from`, in this fixed precedence: `latest`, a stamp, a full key
+/// under the source's own prefix (PRD §9.6 confinement), then a local archive
+/// path. Object forms win, so a local file that happens to share a key's
+/// spelling can never shadow the stored backup.
 fn select_backup(config: &Config, source: &Source, from: &str) -> Result<BackupSelection> {
     let folder = &config.aws.folder;
     if from == "latest" {
@@ -108,13 +110,13 @@ fn select_backup(config: &Config, source: &Source, from: &str) -> Result<BackupS
             from,
         )));
     }
-    let local = Path::new(from);
-    if local.is_file() {
-        return Ok(BackupSelection::LocalFile(local.to_path_buf()));
-    }
     let prefix = source_prefix(folder, &source.name);
     if from.starts_with(&prefix) && !from.contains("..") && parse_key(folder, from).is_some() {
         return Ok(BackupSelection::Object(from.to_string()));
+    }
+    let local = Path::new(from);
+    if local.is_file() {
+        return Ok(BackupSelection::LocalFile(local.to_path_buf()));
     }
     Err(ArkError::Refused(format!(
         "`--from {from}` is not `latest`, a stamp, an existing local file, or a backup key under `{prefix}`"
@@ -192,21 +194,48 @@ async fn extract_archive(
         .await
         .map_err(|e| ArkError::Internal(format!("extraction task failed: {e}")))??;
     if !report.skipped.is_empty() {
-        warn!(source = %source.name, skipped = report.skipped.len(), "some archive entries were refused (see warnings above)");
+        return Err(refused_entries(source, dest, &report));
     }
     info!(source = %source.name, target = %target.name, entries = report.entries, bytes = report.bytes, "file restore complete");
     Ok(())
 }
 
-/// The target directory must be absent or empty (PRD §6.2 step 3).
+/// A refused entry means the archive is not one Arkstore produced or the
+/// target changed underneath us; either way the restore is incomplete and
+/// must not be reported as success. The target is left for inspection.
+fn refused_entries(source: &Source, dest: &Path, report: &UnpackReport) -> ArkError {
+    let first: Vec<&str> = report.skipped.iter().take(3).map(String::as_str).collect();
+    ArkError::Refused(format!(
+        "restore of `{}` is incomplete: {} archive entries were refused (e.g. {}); target `{}` is left as-is for inspection",
+        source.name,
+        report.skipped.len(),
+        first.join("; "),
+        dest.display()
+    ))
+}
+
+/// The target must be absent, or a real (not symlinked) empty directory
+/// (PRD §6.2 step 3). A symlink is refused even when it points at an empty
+/// directory: extraction would otherwise write outside the requested path.
 fn ensure_empty_dir(dest: &Path) -> Result<()> {
-    if dest.is_file() {
+    let meta = match std::fs::symlink_metadata(dest) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    if meta.file_type().is_symlink() {
+        return Err(ArkError::Refused(format!(
+            "target `{}` is a symlink — restore only writes into a real directory",
+            dest.display()
+        )));
+    }
+    if !meta.is_dir() {
         return Err(ArkError::Refused(format!(
             "target `{}` is a file, not a directory",
             dest.display()
         )));
     }
-    if dest.is_dir() && std::fs::read_dir(dest)?.next().is_some() {
+    if std::fs::read_dir(dest)?.next().is_some() {
         return Err(ArkError::Refused(format!(
             "target directory `{}` is not empty — restore only writes into an empty target",
             dest.display()

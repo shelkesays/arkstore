@@ -40,6 +40,22 @@ pub struct AwsConfig {
     /// Custom endpoint for S3-compatible stores (e.g. MinIO). `None` = AWS S3.
     #[serde(default)]
     pub endpoint: Option<String>,
+    /// Integrity check the server enforces on every uploaded part.
+    #[serde(default)]
+    pub checksum: UploadChecksum,
+}
+
+/// Which checksum header each `PUT` / multipart part carries so the object
+/// store verifies the bytes it received (not just their length).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UploadChecksum {
+    /// `x-amz-checksum-sha256` on every part; the server rejects a part whose
+    /// bytes do not hash to it. The default.
+    #[default]
+    Sha256,
+    /// No checksum header — only for S3-compatible stores that reject it.
+    None,
 }
 
 fn default_folder() -> String {

@@ -1,7 +1,8 @@
 //! Object-store access over the `object_store` crate (PRD §9.4): S3 and
 //! S3-compatible endpoints first, with a local-filesystem backend for tests
-//! and an in-memory one for unit tests. Uploads stream in chunks and are
-//! verified by a `HEAD` before they count as done.
+//! and an in-memory one for unit tests. Uploads stream in chunks; on S3 every
+//! part carries a server-verified SHA-256 checksum, and a `HEAD` confirms the
+//! assembled size before the upload counts as done.
 
 use std::path::Path as FsPath;
 use std::sync::Arc;
@@ -9,7 +10,7 @@ use std::sync::Arc;
 use bytes::BytesMut;
 use chrono::{DateTime, Utc};
 use futures::{StreamExt, TryStreamExt};
-use object_store::aws::AmazonS3Builder;
+use object_store::aws::{AmazonS3Builder, Checksum};
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::path::Path;
@@ -18,7 +19,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, info};
 
-use crate::config::{AwsConfig, Config};
+use crate::config::{AwsConfig, Config, UploadChecksum};
 use crate::error::{ArkError, Result};
 use crate::hash::hex;
 use crate::redact::redact;
@@ -65,9 +66,13 @@ impl Store {
     /// standard AWS environment, instance metadata, or a web-identity token —
     /// never from Arkstore config.
     pub fn s3(aws: &AwsConfig) -> Result<Self> {
+        ensure_crypto_provider();
         let mut builder = AmazonS3Builder::from_env()
             .with_bucket_name(&aws.bucket)
             .with_region(&aws.region);
+        if aws.checksum == UploadChecksum::Sha256 {
+            builder = builder.with_checksum_algorithm(Checksum::SHA256);
+        }
         if let Some(endpoint) = &aws.endpoint {
             builder = builder
                 .with_endpoint(endpoint)
@@ -143,9 +148,20 @@ impl Store {
         })
     }
 
+    /// Whether `key` exists (a `HEAD` that treats not-found as `false`).
+    pub async fn exists(&self, key: &str) -> Result<bool> {
+        match self.inner.head(&parse_path(key)?).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(e) => Err(store_err(&format!("head `{key}` failed"), e)),
+        }
+    }
+
     /// Stream `file` to `key` in bounded chunks, hashing as it goes, then
-    /// verify the stored size by `HEAD`. Verification failure is an error —
-    /// an unverified upload never counts as a backup.
+    /// verify the stored size by `HEAD`. On S3 each part additionally carries
+    /// a SHA-256 the server checks (`aws.checksum`), so the bytes — not just
+    /// their count — are verified. Verification failure is an error: an
+    /// unverified upload never counts as a backup.
     pub async fn upload_file(&self, key: &str, file: &FsPath) -> Result<UploadReport> {
         let path = parse_path(key)?;
         let upload = self
@@ -250,6 +266,18 @@ async fn stream_chunks(
         writer.put(chunk.freeze());
     }
     Ok((sent, hex(&hasher.finalize())))
+}
+
+/// rustls is built without a bundled provider (so the S3 client links `ring`,
+/// not aws-lc-rs); make `ring` the process default before the first TLS
+/// handshake. Idempotent, so library callers need no extra setup.
+fn ensure_crypto_provider() {
+    if rustls::crypto::ring::default_provider()
+        .install_default()
+        .is_err()
+    {
+        debug!("rustls crypto provider was already installed");
+    }
 }
 
 fn parse_path(key: &str) -> Result<Path> {

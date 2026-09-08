@@ -17,6 +17,7 @@ aws:
   region: ap-south-1
   folder: dbbackup            # backups live under this prefix; cleanup scans only here
   # endpoint: http://localhost:9000   # uncomment for MinIO / S3-compatible
+  # checksum: sha256            # server-verified per-part SHA-256 (default); `none` only if the store rejects it
 
 cleanup:
   enable: true

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use chrono_tz::Tz;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::{Config, Source, SourceType};
 use crate::engine::ensure_engine;
@@ -113,14 +113,7 @@ async fn backup_file_source(
     stamp: &str,
     dry_run: bool,
 ) -> Result<BackupReport> {
-    let root = PathBuf::from(source.path.as_deref().unwrap_or_default());
-    if !root.is_dir() {
-        return Err(ArkError::Validation(format!(
-            "source `{}`: path `{}` is not a directory",
-            source.name,
-            root.display()
-        )));
-    }
+    let root = canonicalize_root(source)?;
     let rules = IgnoreRules::from_source(source);
     if dry_run {
         return dry_run_file_source(source, &root, &rules, stamp);
@@ -203,6 +196,34 @@ fn dry_run_file_source(
 }
 
 /// Upload the versioned object, verify it, then rewrite the `latest` pointer.
+/// The configured root is operator input, not archive content: a symlink
+/// there is followed once, explicitly, and the resolved path is logged.
+/// Symlinks *inside* the tree are still preserved, never followed.
+fn canonicalize_root(source: &Source) -> Result<PathBuf> {
+    let configured = PathBuf::from(source.path.as_deref().unwrap_or_default());
+    let root = configured.canonicalize().map_err(|e| {
+        ArkError::Validation(format!(
+            "source `{}`: path `{}`: {e}",
+            source.name,
+            configured.display()
+        ))
+    })?;
+    if !root.is_dir() {
+        return Err(ArkError::Validation(format!(
+            "source `{}`: path `{}` is not a directory",
+            source.name,
+            configured.display()
+        )));
+    }
+    if root != configured {
+        debug!(source = %source.name, configured = %configured.display(), resolved = %root.display(), "source path resolved");
+    }
+    Ok(root)
+}
+
+/// Upload to the versioned key — which must not exist yet: versioned objects
+/// are immutable, so a stamp collision (a rerun within the same second, or
+/// the repeated hour at a DST fall-back) fails instead of overwriting.
 async fn upload_versioned(
     store: Option<&Store>,
     config: &Config,
@@ -214,6 +235,11 @@ async fn upload_versioned(
         store.ok_or_else(|| ArkError::Store("no object store configured for upload".into()))?;
     let folder = &config.aws.folder;
     let key = versioned_key(folder, &source.name, stamp);
+    if store.exists(&key).await? {
+        return Err(ArkError::Refused(format!(
+            "`{key}` already exists and versioned backups are immutable (rerun within the same second, or a repeated DST hour?)"
+        )));
+    }
     let report = store.upload_file(&key, &packed.path).await?;
     if report.sha256 != packed.sha256 {
         return Err(ArkError::Store(format!(
@@ -236,6 +262,12 @@ fn keep_local_copy(
     let versioned_dir = source_dir.join("versioned");
     std::fs::create_dir_all(&versioned_dir)?;
     let dest = versioned_dir.join(versioned_file_name(&source.name, stamp));
+    if dest.exists() {
+        return Err(ArkError::Refused(format!(
+            "local archive `{}` already exists and versioned archives are immutable",
+            dest.display()
+        )));
+    }
     std::fs::copy(archive, &dest)?;
     std::fs::copy(&dest, source_dir.join(latest_file_name(&source.name)))?;
     prune_local(&versioned_dir, source)?;
