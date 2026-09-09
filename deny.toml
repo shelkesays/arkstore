@@ -28,6 +28,10 @@ allow = [
   "Zlib",
   "CC0-1.0",
   "MPL-2.0",
+  # Mozilla's CA root-certificate bundle (webpki-root-certs, via reqwest's
+  # rustls-platform-verifier). A permissive *data* license — no copyleft, no
+  # attribution burden — covering certificate data, not code.
+  "CDLA-Permissive-2.0",
 ]
 
 [bans]

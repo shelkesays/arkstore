@@ -5,6 +5,7 @@
 app:
   timezone: Asia/Kolkata      # IANA name; all calendar decisions use this
   log_level: info             # error | warn | info | debug | trace
+  local_dir: arkstore-local   # local copies of finished backups (mirrors the S3 layout)
 
 secrets:
   # Local secrets file (dev / self-hosted), keyed by source / target name.
@@ -16,6 +17,7 @@ aws:
   region: ap-south-1
   folder: dbbackup            # backups live under this prefix; cleanup scans only here
   # endpoint: http://localhost:9000   # uncomment for MinIO / S3-compatible
+  # checksum: sha256            # server-verified per-part SHA-256 (default); `none` only if the store rejects it
 
 cleanup:
   enable: true

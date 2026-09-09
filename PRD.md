@@ -312,7 +312,10 @@ or a single named source via `--source <name>`.
    `verify` compares to (§6.5).
 5. **Package** — tar + stream through compression to a timestamped archive.
 6. **Upload** (when `backup_to_s3` is enabled) to object storage, then **verify** the upload
-   (size / checksum) before declaring success. A source may be configured local-only
+   before declaring success: the stored size is confirmed by `HEAD`, and on S3 every uploaded
+   part carries a SHA-256 the server itself verifies (`aws.checksum`, default `sha256`; `none`
+   only for S3-compatible stores that reject the header). The versioned key must not already
+   exist — see §13 item 4. A source may be configured local-only
    (`backup_to_s3: false`).
 7. **Local artifact lifecycle** — the per-source working directory is always removed; local
    copies of the finished archive are removed only when `delete_after_upload` is true *and* the
@@ -411,7 +414,11 @@ sub-action style, not a `--action` flag.)
    views, routines, triggers, or events in the target database; **Mongo:** no collections in the
    target database (system collections excluded); **file:** the target directory is absent or has
    no entries.
-4. Resolve `--from`, download, and **safely extract** the archive (see §9.6 extraction hardening).
+4. Resolve `--from` (precedence: `latest`, a stamp, a key under the source prefix, then a local
+   archive path — object forms win, so a local file can never shadow a stored backup), download,
+   and **safely extract** the archive (see §9.6 extraction hardening). **Any entry the extractor
+   refuses fails the restore** (exit `1`; the target is left as-is for inspection) — a partial
+   extraction is never reported as complete.
 5. **Validate the archive against its `manifest.json`.** The manifest is the authority on **which
    files each object is expected to have** — so "missing" always means *missing relative to what the
    manifest records*, never "a file some other object type would have." For each object the manifest
@@ -730,7 +737,9 @@ whose contents originate outside the tool), so the following are hard requiremen
 
 - **Safe archive extraction.** Extracting a downloaded archive must reject path traversal
   (`..`, absolute paths), escaping symlinks/hardlinks, and special members — extract data members
-  only. No archive may write outside its intended temp directory.
+  only. No archive may write outside its intended temp directory. A refused member fails the
+  operation rather than being silently dropped. A file-restore target must be a real directory
+  (absent or empty), never a symlink — even one pointing at an empty directory.
 - **Object-key confinement.** A restore-selected object key is confined under the source's prefix;
   reject `..` and absolute/rooted keys. Persisted-plan paths (cleanup) are resolved under the
   plans prefix with the same rejection.
@@ -859,9 +868,12 @@ These are deliberate choices baked into the requirements above. They are recorde
    the config path."
 
 4. **The `latest` pointer is the only mutable object.** Every versioned backup is write-once and
-   never overwritten; only `<source>.latest.tar.gz` is rewritten each run. Rationale: immutable
-   history is safe to cold-tier and safe to reason about in retention; a single mutable pointer
-   gives O(1) "give me the newest" without listing.
+   never overwritten; only `<source>.latest.tar.gz` is rewritten each run. A stamp collision — a
+   rerun within the same second, or the repeated hour at a DST fall-back when `app.timezone`
+   observes DST — **fails that backup** (exit `1`) rather than replacing the existing object; the
+   same rule applies to local copies under `app.local_dir`. Rationale: immutable history is safe
+   to cold-tier and safe to reason about in retention; a single mutable pointer gives O(1) "give
+   me the newest" without listing.
 
 5. **Archives live outside the backup folder.** Archived Parquet uses a sibling top-level prefix
    (`archive.s3_prefix`), never under `aws.folder`. Rationale: cleanup scans the backup folder by

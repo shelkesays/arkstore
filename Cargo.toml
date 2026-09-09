@@ -20,13 +20,32 @@ serde_json = "1"
 serde_yaml = "0.9"
 sha2 = "0.10"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs", "io-util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zeroize = { version = "1", features = ["derive"] }
+# M0-2: object store, packaging, safe extraction, disk headroom.
+bytes = "1"
+flate2 = "1"
+fs4 = { version = "1", features = ["sync"] }
+futures = "0.3"
+# S3 over reqwest + rustls with the `ring` crypto provider. object_store's own
+# `aws` feature hard-wires aws-lc-rs (C, cmake); this trio avoids it:
+#   object_store: aws-base + reqwest + ring
+#   reqwest:      rustls-no-provider   (rustls without a bundled provider)
+#   rustls:       ring                 (installed as the process default in main)
+object_store = { version = "0.14", features = ["aws-base", "reqwest", "ring"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tar = "0.4"
+tempfile = "3"
+
+[package.metadata.cargo-machete]
+# reqwest is a direct dependency only to select its `rustls-no-provider`
+# feature for object_store's HTTP client; the code never names it.
+ignored = ["reqwest"]
 
 [dev-dependencies]
-tempfile = "3"
 
 [features]
 # A sensible default build: Postgres + file sources + Parquet archival.

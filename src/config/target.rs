@@ -311,6 +311,7 @@ mod tests {
                 region: "r".into(),
                 folder: "f".into(),
                 endpoint: None,
+                checksum: Default::default(),
             },
             cleanup: Default::default(),
             archive: Default::default(),

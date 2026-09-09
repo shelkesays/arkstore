@@ -40,6 +40,22 @@ pub struct AwsConfig {
     /// Custom endpoint for S3-compatible stores (e.g. MinIO). `None` = AWS S3.
     #[serde(default)]
     pub endpoint: Option<String>,
+    /// Integrity check the server enforces on every uploaded part.
+    #[serde(default)]
+    pub checksum: UploadChecksum,
+}
+
+/// Which checksum header each `PUT` / multipart part carries so the object
+/// store verifies the bytes it received (not just their length).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UploadChecksum {
+    /// `x-amz-checksum-sha256` on every part; the server rejects a part whose
+    /// bytes do not hash to it. The default.
+    #[default]
+    Sha256,
+    /// No checksum header — only for S3-compatible stores that reject it.
+    None,
 }
 
 fn default_folder() -> String {
@@ -56,6 +72,15 @@ pub struct AppConfig {
     /// Default log level when neither `--log-level` nor `RUST_LOG` is set.
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    /// Where local copies of finished backups live (`<local_dir>/<source>/…`,
+    /// mirroring the S3 layout) when a source is local-only or keeps copies
+    /// after upload. Scratch work happens in temp dirs, not here.
+    #[serde(default = "default_local_dir")]
+    pub local_dir: PathBuf,
+}
+
+fn default_local_dir() -> PathBuf {
+    PathBuf::from("arkstore-local")
 }
 
 fn default_timezone() -> String {
@@ -71,6 +96,7 @@ impl Default for AppConfig {
         Self {
             timezone: default_timezone(),
             log_level: default_log_level(),
+            local_dir: default_local_dir(),
         }
     }
 }

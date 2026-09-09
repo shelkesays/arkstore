@@ -58,6 +58,11 @@ pub enum ArkError {
     #[error("interrupted")]
     Interrupted,
 
+    /// A failure inside Arkstore itself (a worker task died, an invariant
+    /// broke) — a bug, not an operator error.
+    #[error("internal error: {0}")]
+    Internal(String),
+
     /// A code path that is planned but not yet implemented.
     #[error("not yet implemented: {0}")]
     NotImplemented(&'static str),
