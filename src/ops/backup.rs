@@ -1,7 +1,8 @@
 //! Backup: dump databases / snapshot file trees to object storage.
 //!
-//! File sources are complete here (pack → upload + verify → `latest` pointer →
-//! local lifecycle). Database sources need their engine backends (M0-3+).
+//! File sources pack a tree; database sources dump through their native
+//! engine backend into a work directory that is packed the same way. Both
+//! then share one tail: upload + verify → `latest` pointer → local lifecycle.
 
 use std::path::{Path, PathBuf};
 
@@ -10,13 +11,13 @@ use chrono_tz::Tz;
 use tracing::{debug, info, warn};
 
 use crate::config::{Config, Source, SourceType};
-use crate::engine::ensure_engine;
+use crate::engine::{dump_database, ensure_engine, preview_database, DumpContext};
 use crate::error::{ArkError, Result};
 use crate::layout::{
     latest_file_name, latest_key, parse_key, render_stamp, versioned_file_name, versioned_key,
     BackupKind,
 };
-use crate::pack::{pack_tree, IgnoreRules, PackReport};
+use crate::pack::{pack_dir, pack_tree, IgnoreRules, PackReport};
 use crate::store::Store;
 
 /// What one source's backup produced.
@@ -101,9 +102,53 @@ async fn backup_one(
     match source.source_type {
         SourceType::File => backup_file_source(config, store, source, &stamp, dry_run).await,
         SourceType::Postgre | SourceType::Mysql | SourceType::Mongo => {
-            Err(ArkError::NotImplemented("database backup backend (M0-3)"))
+            backup_database_source(config, store, source, &stamp, dry_run).await
         }
     }
+}
+
+/// Dump through the native backend into a work directory, pack it, publish.
+async fn backup_database_source(
+    config: &Config,
+    store: Option<&Store>,
+    source: &Source,
+    stamp: &str,
+    dry_run: bool,
+) -> Result<BackupReport> {
+    if dry_run {
+        let preview = preview_database(source).await?;
+        info!(
+            source = %source.name,
+            server = %preview.server_version,
+            objects = preview.objects,
+            tables_with_data = preview.tables_with_data,
+            data_skipped = preview.data_skipped,
+            would_upload = source.backup_to_s3,
+            "dry run: would dump, pack and upload"
+        );
+        return Ok(BackupReport {
+            source: source.name.clone(),
+            stamp: stamp.to_string(),
+            size: 0,
+            sha256: String::new(),
+            key: None,
+            local_path: None,
+        });
+    }
+    let work = tempfile::tempdir()?;
+    let dump_dir = work.path().join("dump");
+    std::fs::create_dir_all(&dump_dir)?;
+    let ctx = DumpContext {
+        work_dir: &dump_dir,
+        stamp,
+        timezone: &config.app.timezone,
+    };
+    dump_database(source, &ctx).await?;
+    let archive = work.path().join(versioned_file_name(&source.name, stamp));
+    let packed = tokio::task::spawn_blocking(move || pack_dir(&dump_dir, &archive))
+        .await
+        .map_err(|e| ArkError::Internal(format!("packing task failed: {e}")))??;
+    publish(config, store, source, stamp, packed).await
 }
 
 async fn backup_file_source(
@@ -122,6 +167,17 @@ async fn backup_file_source(
     let work = tempfile::tempdir()?;
     let archive = work.path().join(versioned_file_name(&source.name, stamp));
     let packed = pack_in_background(root, rules, archive).await?;
+    publish(config, store, source, stamp, packed).await
+}
+
+/// The shared tail: upload + verify (when enabled), then the local lifecycle.
+async fn publish(
+    config: &Config,
+    store: Option<&Store>,
+    source: &Source,
+    stamp: &str,
+    packed: PackReport,
+) -> Result<BackupReport> {
     let key = if source.backup_to_s3 {
         Some(upload_versioned(store, config, source, stamp, &packed).await?)
     } else {

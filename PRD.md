@@ -243,7 +243,7 @@ silently dropped — and the completeness gate (§6.1) still applies to every li
 
 | Engine | Structure file | Data file | Restore path |
 |---|---|---|---|
-| PostgreSQL | `<obj>.schema.sql` — DDL Arkstore emits, portable by construction | `<obj>.data.copy` — `COPY … TO STDOUT` **text** format (`\N` nulls). Binary `COPY` is an opt-in for same-version/same-architecture speed; text is the portable default | apply DDL, then `COPY … FROM STDIN` |
+| PostgreSQL | `<obj>.schema.sql` — DDL Arkstore emits, portable by construction; what must wait for data (a table's foreign keys, a materialized view's refresh) goes to a separate `<obj>.post.sql`, applied after all data so cycles never block a restore | `<obj>.data.copy` — `COPY … TO STDOUT` **text** format (`\N` nulls). Binary `COPY` is an opt-in for same-version/same-architecture speed; text is the portable default *(implementation status: the binary option is accepted by config but refused by the dump until it lands)* | apply DDL, then `COPY … FROM STDIN`, then the post-data files |
 | MySQL/MariaDB | `<obj>.schema.sql` — `SHOW CREATE …` output | `<obj>.data.tsv` — tab-separated, backslash-escaped, `\N` nulls (the server's own text row format) | apply DDL, then batched multi-row `INSERT` (never `LOAD DATA LOCAL INFILE`, which needs server-side opt-in) |
 | MongoDB | `<coll>.metadata.json` — indexes + options | `<coll>.bson` | `insertMany` batches, then `createIndexes` |
 
@@ -456,8 +456,12 @@ supported — file restores go through the full-tree path.)
 
 **Engine load mechanics (native, §5.1):**
 
-- **PostgreSQL** — apply each object's `schema.sql` over the driver, then stream its `data.copy`
-  via `COPY … FROM STDIN`; restore sequence values last. Constraint-trigger suppression
+- **PostgreSQL** — apply each object's `schema.sql` over the driver (with
+  `check_function_bodies = off` for the session: a string-bodied SQL function may reference
+  relations created later, and the catalog records no dependency for it — the same setting
+  `pg_dump` output relies on), then stream its `data.copy` via `COPY … FROM STDIN`; apply every
+  `post.sql` (foreign keys, materialized-view refresh) after all data; restore sequence values
+  last. Constraint-trigger suppression
   (`SET session_replication_role = replica`) is attempted for speed and FK-cycle tolerance, with
   **retry-with-fallback**: if a permission error blocks it, the load is retried once without it
   rather than failing.

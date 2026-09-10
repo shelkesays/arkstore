@@ -2,6 +2,8 @@
 //! it into an empty target, and exercise the local lifecycle. Helpers return
 //! `Result`; only `#[test]` bodies unwrap.
 
+#![cfg(feature = "files")]
+
 use std::fs;
 use std::path::Path;
 
