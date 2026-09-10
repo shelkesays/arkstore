@@ -107,6 +107,13 @@ deps), and **typos**. CI additionally runs **cargo-deny** (advisories/licenses),
 provided automatically inside the hook environment; to run it directly, install
 `pip install 'safelint[rust]'`.
 
+The live PostgreSQL tests (`tests/postgres_backup.rs`) run only when
+`ARKSTORE_TEST_PG=host:port:user:password:database` points at a **throwaway**
+server (the fixture drops and recreates what it needs); without it they skip.
+Locally: `docker run -d -e POSTGRES_USER=arkstore -e POSTGRES_PASSWORD=arkstore
+-e POSTGRES_DB=appdb -p 54329:5432 postgres:16-alpine`, then
+`ARKSTORE_TEST_PG=localhost:54329:arkstore:arkstore:appdb cargo test`.
+
 ### Branching & releases
 
 This repo follows a two-branch gitflow:

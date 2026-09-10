@@ -39,6 +39,13 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tar = "0.4"
 tempfile = "3"
+# M0-3: native Postgres backend (feature `postgres`). TLS is rustls with the
+# same `ring` provider the S3 client uses; roots come from Mozilla's bundle
+# (already in the tree via reqwest) or the source's `tls_ca_file`.
+tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"], optional = true }
+tokio-postgres-rustls = { version = "0.14", optional = true }
+rustls-pki-types = { version = "1", features = ["std"], optional = true }
+webpki-root-certs = { version = "1", optional = true }
 
 [package.metadata.cargo-machete]
 # reqwest is a direct dependency only to select its `rustls-no-provider`
@@ -52,7 +59,7 @@ ignored = ["reqwest"]
 default = ["postgres", "archive", "files"]
 # Engine drivers become optional dependencies behind these features as each
 # backend lands (M0-3: tokio-postgres; M3: mysql_async, mongodb).
-postgres = []
+postgres = ["dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:rustls-pki-types", "dep:webpki-root-certs"]
 mysql = []
 mongo = []
 archive = []

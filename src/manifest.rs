@@ -35,6 +35,7 @@ pub enum Consistency {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectKind {
+    Schema,
     Table,
     View,
     Matview,
@@ -54,6 +55,10 @@ pub enum FileRole {
     Structure,
     Data,
     Metadata,
+    /// Statements applied only after every object's data is loaded: a
+    /// table's foreign keys, a materialized view's refresh. Keeps
+    /// referential cycles and load order from ever blocking a restore.
+    PostData,
 }
 
 /// One file inside the archive.
