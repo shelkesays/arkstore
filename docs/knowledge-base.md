@@ -157,17 +157,27 @@ The manifest is the archive's authority on what it contains (§5.4). Version 1:
 | `consistent` | bool | `true` iff every object was read inside the source snapshot. `false` only via `allow_unsnapshotted_tables` (§11.1); surfaced by restore and `verify`. |
 | `session` | object | The pinned session settings the data was encoded under (§11.3); empty for Mongo. |
 | `objects[].name` | string | Schema-qualified (`schema.object`) or `db.collection`. |
-| `objects[].kind` | enum | `table` \| `view` \| `matview` \| `sequence` \| `function` \| `trigger` \| `type` \| `extension` \| `collection` \| `mongo_view`. |
+| `objects[].kind` | enum | `schema` \| `table` \| `view` \| `matview` \| `sequence` \| `function` \| `trigger` \| `type` \| `extension` \| `collection` \| `mongo_view`. A `schema` entry (Postgres) carries the `CREATE SCHEMA` so every object in it can depend on it; a partitioned parent is a `table` with no data file (its partitions carry the rows). |
 | `objects[].depends_on` | string[] | Names this object must be created/loaded **after** (FK parents, base relations, referenced types). Drives §5.5. |
 | `objects[].row_count` | int \| null | Rows/documents in the snapshot; `null` for kinds without data. |
 | `objects[].content_hash` | string \| null | `sum256:<64 hex>` (§11.3); SQL tables only. |
 | `objects[].schema_hash` | string | `sha256:<64 hex>` of the object's **canonicalised definition** (emitted DDL / index+option metadata with volatile parts — OIDs, whitespace, ownership — normalised). `verify` (§12) recomputes it from the restored target. |
 | `objects[].consistency` | enum | `snapshot` (read inside the source snapshot) \| `none` (MySQL non-transactional table, opt-in only) \| `per_collection` (Mongo v1). |
-| `objects[].files[]` | object[] | `{path, role, size, sha256}`; `role` ∈ `structure` \| `data` \| `metadata`; `path` relative to the archive root, no `..`, no leading `/`. |
+| `objects[].files[]` | object[] | `{path, role, size, sha256}`; `role` ∈ `structure` \| `data` \| `metadata` \| `post_data`; `path` relative to the archive root, no `..`, no leading `/`. A `post_data` file (`<obj>.post.sql`, SQL engines) holds what must wait until **every** object's data is loaded — a table's foreign keys, a materialized view's refresh — so referential cycles and load order never block a restore. |
 
 Rules: every file in the tar **must** appear in `objects[].files` — a file present in the archive but
 absent from the manifest is logged and **never loaded**; every listed file must exist and match
 its `size` + `sha256` (§5.4). A structure-only object simply lists no `data` file.
+
+Naming: `objects[].name` is `schema.object` for relations, sequences and types,
+`schema.function(identity args)` for functions (overloads stay distinct),
+`schema.table.trigger` for triggers, `extension:<name>` for extensions, and the
+bare schema name for `schema` entries. File stems are the name when it is plain
+lowercase ASCII; anything else is mapped to a safe subset and suffixed with a
+short hash of the original, so names differing only in case or punctuation
+never collide on a case-insensitive filesystem. Objects within one load-plan
+layer are applied in manifest order (schemas, extensions, types, sequences,
+tables, views, materialized views, functions, triggers).
 
 ---
 
@@ -375,8 +385,12 @@ emitted unless `include_privileges` is on, FK constraints are emitted separately
 so they can be deferred (§5.5), and no server-version-specific statements are
 ever written.
 
-- **PostgreSQL** — apply `schema.sql` over the driver; stream `data.copy` with
-  `COPY … FROM STDIN`; set sequence values last. Attempt
+- **PostgreSQL** — apply `schema.sql` over the driver with
+  `check_function_bodies = off` for the session (a string-bodied SQL function
+  may reference relations that are created later, and the catalog records no
+  dependency for it — the same setting `pg_dump` output relies on); stream
+  `data.copy` with `COPY … FROM STDIN`; apply the `post.sql` files (foreign
+  keys, materialized-view refresh) after all data; set sequence values last. Attempt
   `SET session_replication_role = replica` for speed / cycle tolerance, with
   **retry-with-fallback**: on a permission error, retry the load once without it.
 - **MySQL/MariaDB** — apply DDL; load `data.tsv` as **batched multi-row `INSERT`**
@@ -711,7 +725,7 @@ object.
 
 | Engine | Structure | Data | Restore |
 |---|---|---|---|
-| PostgreSQL | `<obj>.schema.sql` (emitted DDL, portable by construction) | `<obj>.data.copy` — `COPY` **text** format, `\N` nulls (binary `COPY` opt-in for same-version/arch) | DDL, then `COPY … FROM STDIN` |
+| PostgreSQL | `<obj>.schema.sql` (emitted DDL, portable by construction); tables with foreign keys and populated materialized views also carry `<obj>.post.sql` (FKs / refresh, applied after all data) | `<obj>.data.copy` — `COPY` **text** format, `\N` nulls (binary `COPY` opt-in for same-version/arch) | DDL, then `COPY … FROM STDIN`, then the post-data files |
 | MySQL/MariaDB | `<obj>.schema.sql` (`SHOW CREATE …`) | `<obj>.data.tsv` — tab-separated, backslash-escaped, `\N` nulls | DDL, then batched multi-row `INSERT` |
 | MongoDB | `<coll>.metadata.json` (indexes + options) | `<coll>.bson` | `insertMany`, then `createIndexes` |
 
@@ -736,7 +750,9 @@ pins the same set before any `COPY`/`SELECT`, and records it in the manifest
 | MySQL/MariaDB | `SET NAMES utf8mb4`, `SET time_zone='+00:00'`, a fixed `sql_mode` (`STRICT_ALL_TABLES,NO_ZERO_DATE,...`), `SET SESSION group_concat_max_len` irrelevant (no aggregation) |
 | MongoDB | none — BSON is self-describing; `verify` compares counts and index definitions only |
 
-**Binary `COPY`** (`copy_format: binary`, opt-in) is faster for same-version/same-arch
+**Binary `COPY`** (`copy_format: binary`, opt-in; *implementation status: accepted by
+config, refused by the dump until it lands — text is the only format written today*)
+is faster for same-version/same-arch
 round-trips but its bytes are not the canonical text, so the content hash is still
 computed from a text export in a second pass — which is why text is the default.
 
