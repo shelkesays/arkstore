@@ -9,7 +9,7 @@ use tokio_postgres::types::FromSql;
 use tokio_postgres::Row;
 
 use super::conn::{engine_err, Conn};
-use crate::error::Result;
+use crate::error::{ArkError, Result};
 
 /// The user-schema filter shared by every query (`n` is `pg_namespace`).
 const USER_SCHEMA: &str = "n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') \
@@ -253,6 +253,35 @@ fn col<'a, T: FromSql<'a>>(row: &'a Row, idx: usize) -> Result<T> {
         .map_err(|e| engine_err(&format!("catalog column {idx}"), e))
 }
 
+/// Reads a row's columns in order and keeps the first error for `done()`,
+/// so a wide struct literal stays a straight line instead of one branch
+/// per column.
+struct Cols<'a> {
+    row: &'a Row,
+    err: Option<ArkError>,
+}
+
+impl<'a> Cols<'a> {
+    fn new(row: &'a Row) -> Self {
+        Self { row, err: None }
+    }
+
+    fn get<T: FromSql<'a> + Default>(&mut self, idx: usize) -> T {
+        match self.row.try_get(idx) {
+            Ok(value) => value,
+            Err(e) => {
+                self.err
+                    .get_or_insert_with(|| engine_err(&format!("catalog column {idx}"), e));
+                T::default()
+            }
+        }
+    }
+
+    fn done(self) -> Result<()> {
+        self.err.map_or(Ok(()), Err)
+    }
+}
+
 fn not_ext(class: &str, oid_expr: &str) -> String {
     format!(
         "NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend x WHERE x.classid = 'pg_catalog.{class}'::regclass \
@@ -263,29 +292,46 @@ fn not_ext(class: &str, oid_expr: &str) -> String {
 impl Catalog {
     /// Read every catalog the fidelity contract covers.
     pub async fn load(conn: &Conn, include_privileges: bool) -> Result<Self> {
-        let mut catalog = Self {
-            schemas: load_schemas(conn).await?,
-            extensions: load_extensions(conn).await?,
-            types: load_types(conn).await?,
-            sequences: load_sequences(conn).await?,
-            relations: load_relations(conn).await?,
-            columns: group(load_columns(conn).await?, |c| c.relid),
-            constraints: group(load_constraints(conn).await?, |c| c.relid),
-            indexes: group(load_indexes(conn).await?, |i| i.relid),
-            triggers: load_triggers(conn).await?,
-            policies: group(load_policies(conn).await?, |p| p.relid),
-            inherits: load_inherits(conn).await?,
-            functions: load_functions(conn).await?,
-            deps: load_deps(conn).await?,
-            dep_maps: load_dep_maps(conn).await?,
-            acls: HashMap::new(),
-            unsupported: load_unsupported(conn).await?,
-        };
+        let mut catalog = load_objects(conn).await?;
+        load_relation_details(conn, &mut catalog).await?;
+        load_graph(conn, &mut catalog).await?;
         if include_privileges {
             catalog.acls = load_acls(conn).await?;
         }
         Ok(catalog)
     }
+}
+
+/// The top-level objects.
+async fn load_objects(conn: &Conn) -> Result<Catalog> {
+    Ok(Catalog {
+        schemas: load_schemas(conn).await?,
+        extensions: load_extensions(conn).await?,
+        types: load_types(conn).await?,
+        sequences: load_sequences(conn).await?,
+        relations: load_relations(conn).await?,
+        functions: load_functions(conn).await?,
+        ..Catalog::default()
+    })
+}
+
+/// Everything attached to a relation, keyed by relation oid.
+async fn load_relation_details(conn: &Conn, catalog: &mut Catalog) -> Result<()> {
+    catalog.columns = group(load_columns(conn).await?, |c| c.relid);
+    catalog.constraints = group(load_constraints(conn).await?, |c| c.relid);
+    catalog.indexes = group(load_indexes(conn).await?, |i| i.relid);
+    catalog.triggers = load_triggers(conn).await?;
+    catalog.policies = group(load_policies(conn).await?, |p| p.relid);
+    catalog.inherits = load_inherits(conn).await?;
+    Ok(())
+}
+
+/// Dependency edges, their lookup maps, and what lies outside the contract.
+async fn load_graph(conn: &Conn, catalog: &mut Catalog) -> Result<()> {
+    catalog.deps = load_deps(conn).await?;
+    catalog.dep_maps = load_dep_maps(conn).await?;
+    catalog.unsupported = load_unsupported(conn).await?;
+    Ok(())
 }
 
 fn group<T, K: std::hash::Hash + Eq>(items: Vec<T>, key: impl Fn(&T) -> K) -> HashMap<K, Vec<T>> {
@@ -379,39 +425,39 @@ async fn load_types(conn: &Conn) -> Result<Vec<TypeDef>> {
 }
 
 fn type_from_row(r: &Row) -> Result<TypeDef> {
-    let typtype: String = col(r, 3)?;
+    let mut c = Cols::new(r);
+    let typtype: String = c.get(3);
     let kind = match typtype.as_str() {
         "e" => TypeKind::Enum,
         "d" => TypeKind::Domain,
         "r" => TypeKind::Range,
         _ => TypeKind::Composite,
     };
-    let range = match kind {
-        TypeKind::Range => Some(RangeDef {
-            subtype: col::<Option<String>>(r, 12)?.unwrap_or_default(),
-            opclass: col(r, 13)?,
-            collation: col(r, 14)?,
-            canonical: col(r, 15)?,
-            subtype_diff: col(r, 16)?,
-        }),
-        _ => None,
-    };
-    Ok(TypeDef {
-        oid: col(r, 0)?,
-        schema: col(r, 1)?,
-        name: col(r, 2)?,
+    let range = (kind == TypeKind::Range).then(|| RangeDef {
+        subtype: c.get::<Option<String>>(12).unwrap_or_default(),
+        opclass: c.get(13),
+        collation: c.get(14),
+        canonical: c.get(15),
+        subtype_diff: c.get(16),
+    });
+    let def = TypeDef {
+        oid: c.get(0),
+        schema: c.get(1),
+        name: c.get(2),
         kind,
-        comment: col(r, 4)?,
-        owner: col(r, 5)?,
-        enum_labels: col(r, 6)?,
-        domain_base: col(r, 7)?,
-        domain_not_null: col(r, 8)?,
-        domain_default: col(r, 9)?,
-        domain_constraints: col(r, 10)?,
-        domain_collation: col(r, 11)?,
+        comment: c.get(4),
+        owner: c.get(5),
+        enum_labels: c.get(6),
+        domain_base: c.get(7),
+        domain_not_null: c.get(8),
+        domain_default: c.get(9),
+        domain_constraints: c.get(10),
+        domain_collation: c.get(11),
         range,
-        relid: col(r, 17)?,
-    })
+        relid: c.get(17),
+    };
+    c.done()?;
+    Ok(def)
 }
 
 async fn load_sequences(conn: &Conn) -> Result<Vec<Sequence>> {
@@ -433,27 +479,32 @@ async fn load_sequences(conn: &Conn) -> Result<Vec<Sequence>> {
     conn.rows(&sql, &[])
         .await?
         .iter()
-        .map(|r| {
-            Ok(Sequence {
-                oid: col(r, 0)?,
-                schema: col(r, 1)?,
-                name: col(r, 2)?,
-                data_type: col(r, 3)?,
-                start: col(r, 4)?,
-                increment: col(r, 5)?,
-                min: col(r, 6)?,
-                max: col(r, 7)?,
-                cache: col(r, 8)?,
-                cycle: col(r, 9)?,
-                last_value: col(r, 10)?,
-                owner_rel: col(r, 11)?,
-                owner_col: col(r, 12)?,
-                owner_dep: col(r, 13)?,
-                comment: col(r, 14)?,
-                owner: col(r, 15)?,
-            })
-        })
+        .map(sequence_from_row)
         .collect()
+}
+
+fn sequence_from_row(r: &Row) -> Result<Sequence> {
+    let mut c = Cols::new(r);
+    let seq = Sequence {
+        oid: c.get(0),
+        schema: c.get(1),
+        name: c.get(2),
+        data_type: c.get(3),
+        start: c.get(4),
+        increment: c.get(5),
+        min: c.get(6),
+        max: c.get(7),
+        cache: c.get(8),
+        cycle: c.get(9),
+        last_value: c.get(10),
+        owner_rel: c.get(11),
+        owner_col: c.get(12),
+        owner_dep: c.get(13),
+        comment: c.get(14),
+        owner: c.get(15),
+    };
+    c.done()?;
+    Ok(seq)
 }
 
 async fn load_relations(conn: &Conn) -> Result<Vec<Relation>> {
@@ -481,12 +532,13 @@ async fn load_relations(conn: &Conn) -> Result<Vec<Relation>> {
 }
 
 fn relation_from_row(r: &Row) -> Result<Relation> {
-    let relkind: String = col(r, 3)?;
-    let persistence: String = col(r, 4)?;
-    Ok(Relation {
-        oid: col(r, 0)?,
-        schema: col(r, 1)?,
-        name: col(r, 2)?,
+    let mut c = Cols::new(r);
+    let relkind: String = c.get(3);
+    let persistence: String = c.get(4);
+    let rel = Relation {
+        oid: c.get(0),
+        schema: c.get(1),
+        name: c.get(2),
         kind: match relkind.as_str() {
             "p" => RelKind::Partitioned,
             "v" => RelKind::View,
@@ -494,18 +546,20 @@ fn relation_from_row(r: &Row) -> Result<Relation> {
             _ => RelKind::Table,
         },
         unlogged: persistence == "u",
-        is_partition: col(r, 5)?,
-        part_bound: col(r, 6)?,
-        part_key: col(r, 7)?,
-        options: col::<Option<String>>(r, 8)?.filter(|o| !o.is_empty()),
-        row_security: col(r, 9)?,
-        force_row_security: col(r, 10)?,
-        comment: col(r, 11)?,
-        owner: col(r, 12)?,
-        view_def: col(r, 13)?,
-        populated: col(r, 14)?,
-        access_method: col(r, 15)?,
-    })
+        is_partition: c.get(5),
+        part_bound: c.get(6),
+        part_key: c.get(7),
+        options: c.get::<Option<String>>(8).filter(|o| !o.is_empty()),
+        row_security: c.get(9),
+        force_row_security: c.get(10),
+        comment: c.get(11),
+        owner: c.get(12),
+        view_def: c.get(13),
+        populated: c.get(14),
+        access_method: c.get(15),
+    };
+    c.done()?;
+    Ok(rel)
 }
 
 async fn load_columns(conn: &Conn) -> Result<Vec<Column>> {
@@ -529,22 +583,27 @@ async fn load_columns(conn: &Conn) -> Result<Vec<Column>> {
     conn.rows(&sql, &[])
         .await?
         .iter()
-        .map(|r| {
-            Ok(Column {
-                relid: col(r, 0)?,
-                num: col(r, 1)?,
-                name: col(r, 2)?,
-                data_type: col(r, 3)?,
-                not_null: col(r, 4)?,
-                default_expr: col(r, 5)?,
-                identity: col(r, 6)?,
-                generated: col(r, 7)?,
-                collation: col(r, 8)?,
-                comment: col(r, 9)?,
-                is_local: col(r, 10)?,
-            })
-        })
+        .map(column_from_row)
         .collect()
+}
+
+fn column_from_row(r: &Row) -> Result<Column> {
+    let mut c = Cols::new(r);
+    let column = Column {
+        relid: c.get(0),
+        num: c.get(1),
+        name: c.get(2),
+        data_type: c.get(3),
+        not_null: c.get(4),
+        default_expr: c.get(5),
+        identity: c.get(6),
+        generated: c.get(7),
+        collation: c.get(8),
+        comment: c.get(9),
+        is_local: c.get(10),
+    };
+    c.done()?;
+    Ok(column)
 }
 
 async fn load_constraints(conn: &Conn) -> Result<Vec<Constraint>> {
@@ -740,51 +799,66 @@ async fn load_deps(conn: &Conn) -> Result<Vec<Dep>> {
 }
 
 async fn load_dep_maps(conn: &Conn) -> Result<DepMaps> {
-    let mut maps = DepMaps::default();
     let rewrite = format!(
         "SELECT r.oid, r.ev_class FROM pg_catalog.pg_rewrite r WHERE r.ev_class >= {FIRST_USER_OID}"
     );
-    for r in conn.rows(&rewrite, &[]).await? {
-        maps.rewrite_rel.insert(col(&r, 0)?, col(&r, 1)?);
-    }
     let attrdef = format!(
         "SELECT d.oid, d.adrelid FROM pg_catalog.pg_attrdef d WHERE d.adrelid >= {FIRST_USER_OID}"
     );
-    for r in conn.rows(&attrdef, &[]).await? {
-        maps.attrdef_rel.insert(col(&r, 0)?, col(&r, 1)?);
-    }
     let constraint = format!(
         "SELECT c.oid, c.conrelid FROM pg_catalog.pg_constraint c \
          WHERE c.oid >= {FIRST_USER_OID} AND c.conrelid <> 0"
     );
-    for r in conn.rows(&constraint, &[]).await? {
-        maps.constraint_rel.insert(col(&r, 0)?, col(&r, 1)?);
-    }
     let types = format!(
         "SELECT t.oid, t.typrelid, t.typelem FROM pg_catalog.pg_type t WHERE t.oid >= {FIRST_USER_OID}"
     );
-    for r in conn.rows(&types, &[]).await? {
-        maps.type_rel_elem
-            .insert(col(&r, 0)?, (col(&r, 1)?, col(&r, 2)?));
-    }
     let indexes = format!(
         "SELECT i.indexrelid, i.indrelid FROM pg_catalog.pg_index i WHERE i.indrelid >= {FIRST_USER_OID}"
     );
-    for r in conn.rows(&indexes, &[]).await? {
-        maps.index_rel.insert(col(&r, 0)?, col(&r, 1)?);
-    }
-    let owned =
-        "SELECT d.classid::regclass::text, d.objid, d.refobjid FROM pg_catalog.pg_depend d \
-                 WHERE d.deptype = 'e' AND d.refclassid = 'pg_catalog.pg_extension'::regclass";
-    for r in conn.rows(owned, &[]).await? {
+    Ok(DepMaps {
+        rewrite_rel: oid_pairs(conn, &rewrite).await?.into_iter().collect(),
+        attrdef_rel: oid_pairs(conn, &attrdef).await?.into_iter().collect(),
+        constraint_rel: oid_pairs(conn, &constraint).await?.into_iter().collect(),
+        type_rel_elem: oid_triples(conn, &types)
+            .await?
+            .into_iter()
+            .map(|(oid, rel, elem)| (oid, (rel, elem)))
+            .collect(),
+        index_rel: oid_pairs(conn, &indexes).await?.into_iter().collect(),
+        ext_owned: load_ext_owned(conn).await?,
+    })
+}
+
+async fn oid_pairs(conn: &Conn, sql: &str) -> Result<Vec<(u32, u32)>> {
+    conn.rows(sql, &[])
+        .await?
+        .iter()
+        .map(|r| Ok((col(r, 0)?, col(r, 1)?)))
+        .collect()
+}
+
+async fn oid_triples(conn: &Conn, sql: &str) -> Result<Vec<(u32, u32, u32)>> {
+    conn.rows(sql, &[])
+        .await?
+        .iter()
+        .map(|r| Ok((col(r, 0)?, col(r, 1)?, col(r, 2)?)))
+        .collect()
+}
+
+/// (catalog, oid) of every extension-owned object → its extension.
+async fn load_ext_owned(conn: &Conn) -> Result<HashMap<(String, u32), u32>> {
+    let sql = "SELECT d.classid::regclass::text, d.objid, d.refobjid FROM pg_catalog.pg_depend d \
+               WHERE d.deptype = 'e' AND d.refclassid = 'pg_catalog.pg_extension'::regclass";
+    let mut out = HashMap::new();
+    for r in conn.rows(sql, &[]).await? {
         let class = col::<String>(&r, 0)?
             .rsplit('.')
             .next()
             .unwrap_or_default()
             .to_string();
-        maps.ext_owned.insert((class, col(&r, 1)?), col(&r, 2)?);
+        out.insert((class, col(&r, 1)?), col(&r, 2)?);
     }
-    Ok(maps)
+    Ok(out)
 }
 
 async fn load_unsupported(conn: &Conn) -> Result<Vec<(String, i64)>> {

@@ -10,10 +10,12 @@ use std::path::Path;
 
 use arkstore::config::Config;
 use arkstore::error::ArkError;
-use arkstore::manifest::{FileRole, Manifest, ObjectKind};
+use arkstore::manifest::{FileRole, Manifest, ObjectEntry, ObjectKind};
 use arkstore::ops::backup;
-use arkstore::pack::unpack;
+use arkstore::pack::{digest_file, unpack};
 use arkstore::store::Store;
+
+type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 /// The tests share one database, so they run one at a time.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -52,7 +54,7 @@ async fn load_fixture(t: &Target) -> Result<(), tokio_postgres::Error> {
         .password(&t.password)
         .dbname(&t.database);
     let (client, connection) = config.connect(tokio_postgres::NoTls).await?;
-    tokio::spawn(async move {
+    let _driver = tokio::spawn(async move {
         let _ = connection.await;
     });
     client
@@ -86,43 +88,44 @@ fn write_config(base: &Path, t: &Target) -> arkstore::Result<Config> {
     Config::load(&base.join("arkstore.yaml"))
 }
 
-fn object<'a>(manifest: &'a Manifest, name: &str) -> &'a arkstore::manifest::ObjectEntry {
+fn object<'a>(manifest: &'a Manifest, name: &str) -> Result<&'a ObjectEntry, String> {
     manifest
         .objects
         .iter()
         .find(|o| o.name == name)
-        .unwrap_or_else(|| panic!("object {name} missing from manifest"))
+        .ok_or_else(|| format!("object {name} missing from manifest"))
 }
 
-#[tokio::test]
-async fn postgres_dump_round_trips_into_a_manifested_archive() {
-    let _serial = SERIAL.lock().await;
-    let Some(t) = target() else {
-        eprintln!("ARKSTORE_TEST_PG not set; skipping live PostgreSQL test");
-        return;
-    };
-    load_fixture(&t).await.unwrap();
-    let base = tempfile::tempdir().unwrap();
-    let config = write_config(base.path(), &t).unwrap();
-    let store = Store::local(&base.path().join("bucket")).unwrap();
+fn depends(entry: &ObjectEntry, on: &str) -> bool {
+    entry.depends_on.iter().any(|d| d == on)
+}
 
-    let failed = backup::run_with_store(&config, Some(&store), None, None, false)
-        .await
-        .unwrap();
+fn text(out: &Path, name: &str) -> Result<String, std::io::Error> {
+    fs::read_to_string(out.join(name))
+}
+
+/// Back up, download, unpack; return the unpacked directory and manifest.
+async fn dump_and_unpack(
+    base: &Path,
+    t: &Target,
+) -> Result<(std::path::PathBuf, Manifest), Box<dyn std::error::Error>> {
+    let config = write_config(base, t)?;
+    let store = Store::local(&base.join("bucket"))?;
+    let failed = backup::run_with_store(&config, Some(&store), None, None, false).await?;
     assert!(failed.is_empty(), "{failed:?}");
-
-    let versioned = store.list("dbbackup/appdb/versioned/").await.unwrap();
+    let versioned = store.list("dbbackup/appdb/versioned/").await?;
     assert_eq!(versioned.len(), 1);
-    let archive = base.path().join("backup.tar.gz");
-    store
-        .download_to_file(&versioned[0].key, &archive)
-        .await
-        .unwrap();
-    let out = base.path().join("out");
-    let report = unpack(&archive, &out).unwrap();
+    let archive = base.join("backup.tar.gz");
+    let key = versioned.first().ok_or("no versioned object")?.key.clone();
+    store.download_to_file(&key, &archive).await?;
+    let out = base.join("out");
+    let report = unpack(&archive, &out)?;
     assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    let manifest = Manifest::from_json(&fs::read(out.join("manifest.json"))?)?;
+    Ok((out, manifest))
+}
 
-    let manifest = Manifest::from_json(&fs::read(out.join("manifest.json")).unwrap()).unwrap();
+fn check_manifest_header_and_files(out: &Path, manifest: &Manifest) -> TestResult {
     assert_eq!(manifest.snapshot.kind, "pg_snapshot");
     assert!(manifest.snapshot.id.is_some());
     assert!(manifest.consistent);
@@ -130,30 +133,26 @@ async fn postgres_dump_round_trips_into_a_manifested_archive() {
         manifest.session.get("DateStyle").map(String::as_str),
         Some("ISO, YMD")
     );
-
-    // Every manifest file exists with the recorded size and digest.
-    for file in manifest.file_paths() {
-        let entry = manifest
-            .objects
-            .iter()
-            .flat_map(|o| o.files.iter())
-            .find(|f| f.path == file)
-            .unwrap();
-        let (size, sha) = arkstore::pack::digest_file(&out.join(file)).unwrap();
-        assert_eq!((size, sha), (entry.size, entry.sha256.clone()), "{file}");
+    for entry in manifest.objects.iter().flat_map(|o| o.files.iter()) {
+        let (size, sha) = digest_file(&out.join(&entry.path))?;
+        assert_eq!(
+            (size, sha),
+            (entry.size, entry.sha256.clone()),
+            "{}",
+            entry.path
+        );
     }
+    Ok(())
+}
 
-    let customers = object(&manifest, "shop.customers");
+fn check_customers(out: &Path, manifest: &Manifest) -> TestResult {
+    let customers = object(manifest, "shop.customers")?;
     assert_eq!(customers.kind, ObjectKind::Table);
     assert_eq!(customers.row_count, Some(3));
-    assert!(customers
-        .content_hash
-        .as_deref()
-        .unwrap()
-        .starts_with("sum256:"));
-    assert!(customers.depends_on.contains(&"shop".to_string()));
-    assert!(customers.depends_on.contains(&"shop.mood".to_string()));
-    let structure = fs::read_to_string(out.join("shop.customers.schema.sql")).unwrap();
+    let hash = customers.content_hash.as_deref().unwrap_or_default();
+    assert!(hash.starts_with("sum256:"), "{hash}");
+    assert!(depends(customers, "shop") && depends(customers, "shop.mood"));
+    let structure = text(out, "shop.customers.schema.sql")?;
     assert!(
         structure.contains("CREATE TABLE \"shop\".\"customers\""),
         "{structure}"
@@ -171,137 +170,149 @@ async fn postgres_dump_round_trips_into_a_manifested_archive() {
         !structure.contains("GRANT"),
         "privileges are opt-in: {structure}"
     );
-    let data = fs::read_to_string(out.join("shop.customers.data.copy")).unwrap();
+    let data = text(out, "shop.customers.data.copy")?;
     assert_eq!(data.lines().count(), 3);
     assert!(
         data.contains("tab\\there") && data.contains("new\\nline"),
         "{data}"
     );
+    Ok(())
+}
 
-    let orders = object(&manifest, "shop.orders");
-    assert!(orders.depends_on.contains(&"shop.customers".to_string()));
+fn check_orders_and_sequences(out: &Path, manifest: &Manifest) -> TestResult {
+    let orders = object(manifest, "shop.orders")?;
+    assert!(depends(orders, "shop.customers"));
     assert!(
-        !orders.depends_on.contains(&"shop.orders".to_string()),
+        !depends(orders, "shop.orders"),
         "self-FK is not a dependency"
     );
     assert!(orders.files.iter().any(|f| f.role == FileRole::PostData));
-    let fks = fs::read_to_string(out.join("shop.orders.post.sql")).unwrap();
-    assert!(fks.contains("FOREIGN KEY"), "{fks}");
-    let orders_ddl = fs::read_to_string(out.join("shop.orders.schema.sql")).unwrap();
-    assert!(
-        orders_ddl.contains("GENERATED ALWAYS AS IDENTITY"),
-        "{orders_ddl}"
-    );
-    assert!(orders_ddl.contains("STORED"), "{orders_ddl}");
-    assert!(
-        orders_ddl.contains("setval"),
-        "identity value restored: {orders_ddl}"
-    );
-    assert!(!orders_ddl.contains("FOREIGN KEY"), "{orders_ddl}");
-
+    let post = text(out, "shop.orders.post.sql")?;
+    assert!(post.contains("FOREIGN KEY"), "{post}");
+    let ddl = text(out, "shop.orders.schema.sql")?;
+    assert!(ddl.contains("GENERATED ALWAYS AS IDENTITY"), "{ddl}");
+    assert!(ddl.contains("STORED"), "{ddl}");
+    assert!(ddl.contains("setval"), "identity value restored: {ddl}");
+    assert!(!ddl.contains("FOREIGN KEY"), "{ddl}");
     // Serial sequence is its own object; identity sequence is not.
-    object(&manifest, "shop.customers_id_seq");
+    object(manifest, "shop.customers_id_seq")?;
     assert!(manifest
         .objects
         .iter()
         .all(|o| o.name != "shop.orders_id_seq"));
+    Ok(())
+}
 
+fn check_partitions_and_ignores(manifest: &Manifest) -> TestResult {
     // Partitioned parent has structure but no data; partitions carry rows.
-    let events = object(&manifest, "shop.events");
-    assert_eq!(events.row_count, None);
-    assert_eq!(object(&manifest, "shop.events_2025").row_count, Some(1));
-    assert!(object(&manifest, "shop.events_2025")
-        .depends_on
-        .contains(&"shop.events".to_string()));
-
+    assert_eq!(object(manifest, "shop.events")?.row_count, None);
+    let partition = object(manifest, "shop.events_2025")?;
+    assert_eq!(partition.row_count, Some(1));
+    assert!(depends(partition, "shop.events"));
     // Ignore semantics: data skipped, structure kept; prefix excluded outright.
-    let skipped = object(&manifest, "public.skip_me");
+    let skipped = object(manifest, "public.skip_me")?;
     assert_eq!(skipped.row_count, None);
     assert!(skipped.files.iter().all(|f| f.role != FileRole::Data));
     assert!(manifest
         .objects
         .iter()
         .all(|o| o.name != "public.pg_prefixed_ignore"));
+    // An index on an extension's operator class depends on that extension.
+    assert!(depends(
+        object(manifest, "public.plain")?,
+        "extension:pg_trgm"
+    ));
+    Ok(())
+}
 
-    // Views, matviews, functions, triggers, types, extensions, schemas.
+fn check_other_kinds_and_plan(out: &Path, manifest: &Manifest) -> TestResult {
+    let view = object(manifest, "shop.customer_totals")?;
+    assert_eq!(view.kind, ObjectKind::View);
+    assert!(depends(view, "shop.total_for(cust integer)"));
     assert_eq!(
-        object(&manifest, "shop.customer_totals").kind,
-        ObjectKind::View
-    );
-    assert!(object(&manifest, "shop.customer_totals")
-        .depends_on
-        .contains(&"shop.total_for(cust integer)".to_string()));
-    assert_eq!(
-        object(&manifest, "shop.mood_counts").kind,
+        object(manifest, "shop.mood_counts")?.kind,
         ObjectKind::Matview
     );
-    let refresh = fs::read_to_string(out.join("shop.mood_counts.post.sql")).unwrap();
+    let refresh = text(out, "shop.mood_counts.post.sql")?;
     assert!(refresh.contains("REFRESH MATERIALIZED VIEW"), "{refresh}");
-    let matview_ddl = fs::read_to_string(out.join("shop.mood_counts.schema.sql")).unwrap();
+    let matview_ddl = text(out, "shop.mood_counts.schema.sql")?;
     assert!(
         !matview_ddl.contains("REFRESH"),
         "refresh must wait for data: {matview_ddl}"
     );
     assert_eq!(
-        object(&manifest, "shop.orders.orders_touch").kind,
+        object(manifest, "shop.orders.orders_touch")?.kind,
         ObjectKind::Trigger
     );
-    let trigger =
-        fs::read_to_string(out.join("shop.orders.orders_touch_disabled.schema.sql")).unwrap();
+    let trigger = text(out, "shop.orders.orders_touch_disabled.schema.sql")?;
     assert!(trigger.contains("DISABLE TRIGGER"), "{trigger}");
-    assert_eq!(object(&manifest, "shop.mood").kind, ObjectKind::Type);
+    assert_eq!(object(manifest, "shop.mood")?.kind, ObjectKind::Type);
     assert_eq!(
-        object(&manifest, "extension:pg_trgm").kind,
+        object(manifest, "extension:pg_trgm")?.kind,
         ObjectKind::Extension
     );
-    assert_eq!(object(&manifest, "shop").kind, ObjectKind::Schema);
-
+    assert_eq!(object(manifest, "shop")?.kind, ObjectKind::Schema);
     // The load plan is acyclic apart from the deliberate a_cycle/b_cycle pair.
     let plan = manifest.load_plan();
     let cyclic: Vec<&str> = plan.cyclic.iter().map(|o| o.name.as_str()).collect();
     assert_eq!(cyclic, vec!["shop.a_cycle", "shop.b_cycle"], "{cyclic:?}");
     assert!(plan.layers.len() >= 3, "{}", plan.layers.len());
+    Ok(())
 }
 
 #[tokio::test]
-async fn postgres_dry_run_reports_without_writing() {
+async fn postgres_dump_round_trips_into_a_manifested_archive() -> TestResult {
     let _serial = SERIAL.lock().await;
     let Some(t) = target() else {
-        return;
+        eprintln!("ARKSTORE_TEST_PG not set; skipping live PostgreSQL test");
+        return Ok(());
     };
-    load_fixture(&t).await.unwrap();
-    let base = tempfile::tempdir().unwrap();
-    let config = write_config(base.path(), &t).unwrap();
-    let failed = backup::run_with_store(&config, None, None, None, true)
-        .await
-        .unwrap();
+    load_fixture(&t).await?;
+    let base = tempfile::tempdir()?;
+    let (out, manifest) = dump_and_unpack(base.path(), &t).await?;
+    check_manifest_header_and_files(&out, &manifest)?;
+    check_customers(&out, &manifest)?;
+    check_orders_and_sequences(&out, &manifest)?;
+    check_partitions_and_ignores(&manifest)?;
+    check_other_kinds_and_plan(&out, &manifest)
+}
+
+#[tokio::test]
+async fn postgres_dry_run_reports_without_writing() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let Some(t) = target() else {
+        return Ok(());
+    };
+    load_fixture(&t).await?;
+    let base = tempfile::tempdir()?;
+    let config = write_config(base.path(), &t)?;
+    let failed = backup::run_with_store(&config, None, None, None, true).await?;
     assert!(failed.is_empty(), "{failed:?}");
     assert!(!base.path().join("local").exists());
+    Ok(())
 }
 
 #[tokio::test]
-async fn postgres_binary_copy_is_refused_for_now() {
+async fn postgres_binary_copy_is_refused_for_now() -> TestResult {
     let _serial = SERIAL.lock().await;
     let Some(t) = target() else {
-        return;
+        return Ok(());
     };
-    let base = tempfile::tempdir().unwrap();
-    let mut config = write_config(base.path(), &t).unwrap();
+    let base = tempfile::tempdir()?;
+    let mut config = write_config(base.path(), &t)?;
     config.sources[0].copy_format = Some(arkstore::config::CopyFormat::Binary);
-    let store = Store::local(&base.path().join("bucket")).unwrap();
-    let failed = backup::run_with_store(&config, Some(&store), None, None, false)
-        .await
-        .unwrap();
+    let store = Store::local(&base.path().join("bucket"))?;
+    let failed = backup::run_with_store(&config, Some(&store), None, None, false).await?;
     assert_eq!(failed, vec!["appdb".to_string()]);
-    let err = arkstore::engine::dump_database(
-        &config.sources[0],
-        &arkstore::engine::DumpContext {
-            work_dir: base.path(),
-            stamp: "2026-01-01-000000",
-            timezone: "UTC",
-        },
-    )
-    .await
-    .unwrap_err();
-    assert!(matches!(err, ArkError::NotImplemented(_)), "{err}");
+    let ctx = arkstore::engine::DumpContext {
+        work_dir: base.path(),
+        stamp: "2026-01-01-000000",
+        timezone: "UTC",
+    };
+    let outcome = arkstore::engine::dump_database(&config.sources[0], &ctx).await;
+    assert!(
+        matches!(outcome, Err(ArkError::NotImplemented(_))),
+        "{outcome:?}"
+    );
+    Ok(())
 }

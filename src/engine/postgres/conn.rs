@@ -57,7 +57,7 @@ impl Drop for Conn {
 
 impl Conn {
     /// Connect, gate the version, and pin the session settings.
-    pub async fn open(source: &Source) -> Result<Self> {
+    pub async fn connect(source: &Source) -> Result<Self> {
         let config = pg_config(source);
         let (client, driver) = match source.tls {
             TlsMode::Disable => connect_plain(&config).await?,

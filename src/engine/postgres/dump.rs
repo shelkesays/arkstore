@@ -62,7 +62,7 @@ pub async fn dump(source: &Source, ctx: &DumpContext<'_>) -> Result<Manifest> {
             "copy_format: binary (text COPY is the v1 data format)",
         ));
     }
-    let conn = Conn::open(source).await?;
+    let conn = Conn::connect(source).await?;
     let snapshot_id = conn.begin_snapshot().await?;
     let created_at = Utc::now();
     let catalog = Catalog::load(&conn, source.effective_include_privileges()).await?;
@@ -73,17 +73,35 @@ pub async fn dump(source: &Source, ctx: &DumpContext<'_>) -> Result<Manifest> {
         include_privileges: source.effective_include_privileges(),
         rel_names: rel_names(&catalog),
     };
-    let mut objects = Vec::with_capacity(plan.items.len());
-    for (i, item) in plan.items.iter().enumerate() {
-        let depends_on = plan.depends_on(i, &catalog);
-        objects.push(write_object(&conn, source, ctx.work_dir, item, &emitter, depends_on).await?);
-    }
+    let objects = write_objects(&conn, source, ctx.work_dir, &plan, &emitter).await?;
     conn.end_snapshot().await?;
-    let manifest = Manifest {
+    let manifest = build_manifest(
+        source,
+        ctx,
+        &conn.server_version,
+        snapshot_id,
+        created_at,
+        objects,
+    );
+    manifest.validate()?;
+    std::fs::write(ctx.work_dir.join("manifest.json"), manifest.to_json()?)?;
+    info!(source = %source.name, objects = manifest.objects.len(), server = %conn.server_version, "dump complete");
+    Ok(manifest)
+}
+
+fn build_manifest(
+    source: &Source,
+    ctx: &DumpContext<'_>,
+    server_version: &str,
+    snapshot_id: String,
+    created_at: chrono::DateTime<Utc>,
+    objects: Vec<ObjectEntry>,
+) -> Manifest {
+    Manifest {
         manifest_version: MANIFEST_VERSION,
         source: source.name.clone(),
         engine: source.source_type,
-        server_version: conn.server_version.clone(),
+        server_version: server_version.to_string(),
         created_at,
         stamp: ctx.stamp.to_string(),
         timezone: ctx.timezone.to_string(),
@@ -97,16 +115,12 @@ pub async fn dump(source: &Source, ctx: &DumpContext<'_>) -> Result<Manifest> {
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect::<BTreeMap<_, _>>(),
         objects,
-    };
-    manifest.validate()?;
-    std::fs::write(ctx.work_dir.join("manifest.json"), manifest.to_json()?)?;
-    info!(source = %source.name, objects = manifest.objects.len(), server = %conn.server_version, "dump complete");
-    Ok(manifest)
+    }
 }
 
 /// Connect, snapshot, enumerate — report counts without writing.
 pub async fn preview(source: &Source) -> Result<DumpPreview> {
-    let conn = Conn::open(source).await?;
+    let conn = Conn::connect(source).await?;
     conn.begin_snapshot().await?;
     let catalog = Catalog::load(&conn, source.effective_include_privileges()).await?;
     log_unsupported(source, &catalog);
@@ -447,6 +461,22 @@ fn script_for(item: &Item, emitter: &Emitter<'_>) -> Script {
         What::Function(i) => emitter.function(&c.functions[i]),
         What::Trigger(i) => emitter.trigger(&c.triggers[i]),
     }
+}
+
+/// Write every planned object, in manifest order.
+async fn write_objects(
+    conn: &Conn,
+    source: &Source,
+    dir: &Path,
+    plan: &Plan,
+    emitter: &Emitter<'_>,
+) -> Result<Vec<ObjectEntry>> {
+    let mut objects = Vec::with_capacity(plan.items.len());
+    for (i, item) in plan.items.iter().enumerate() {
+        let depends_on = plan.depends_on(i, emitter.catalog);
+        objects.push(write_object(conn, source, dir, item, emitter, depends_on).await?);
+    }
+    Ok(objects)
 }
 
 /// Write one object's files and describe it for the manifest.
