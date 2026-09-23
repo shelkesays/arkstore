@@ -230,6 +230,25 @@ async fn restore_recreates_the_database_from_the_manifest() -> TestResult {
     Ok(())
 }
 
+/// Take the stored archive apart, corrupt one data file, put it back together.
+async fn tamper_archive(
+    base: &Path,
+    store: &Store,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let versioned = store.list("dbbackup/appdb/versioned/").await?;
+    let key = versioned.first().ok_or("no versioned backup")?.key.clone();
+    let original = base.join("original.tar.gz");
+    store.download_to_file(&key, &original).await?;
+    let work = base.join("work");
+    unpack(&original, &work)?;
+    let mut scratch = fs::read_to_string(work.join("shop.scratch.data.copy"))?;
+    scratch.push_str("zz\t9\n");
+    fs::write(work.join("shop.scratch.data.copy"), scratch)?;
+    let tampered = base.join("tampered.tar.gz");
+    pack_dir(&work, &tampered)?;
+    Ok(tampered)
+}
+
 #[tokio::test]
 async fn a_corrupt_data_file_fails_only_its_object() -> TestResult {
     let _serial = SERIAL.lock().await;
@@ -241,19 +260,7 @@ async fn a_corrupt_data_file_fails_only_its_object() -> TestResult {
     let (config, store) = seed(base.path(), &t, &db).await?;
     fresh_database(&t, &db).await?;
 
-    // Take the archive apart, tamper with one data file, put it back together.
-    let versioned = store.list("dbbackup/appdb/versioned/").await?;
-    let key = versioned.first().ok_or("no versioned backup")?.key.clone();
-    let original = base.path().join("original.tar.gz");
-    store.download_to_file(&key, &original).await?;
-    let work = base.path().join("work");
-    unpack(&original, &work)?;
-    let mut scratch = fs::read_to_string(work.join("shop.scratch.data.copy"))?;
-    scratch.push_str("zz\t9\n");
-    fs::write(work.join("shop.scratch.data.copy"), scratch)?;
-    let tampered = base.path().join("tampered.tar.gz");
-    pack_dir(&work, &tampered)?;
-
+    let tampered = tamper_archive(base.path(), &store).await?;
     let from = tampered.to_string_lossy().into_owned();
     let failed = restore::run_with_store(&config, &store, &request(&from), false).await?;
     assert_eq!(

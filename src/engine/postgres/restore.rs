@@ -18,7 +18,7 @@ use super::sql::qualified;
 use crate::config::ResolvedTarget;
 use crate::engine::{RestoreOutcome, TargetContents};
 use crate::error::{ArkError, Result};
-use crate::manifest::{FileRole, Manifest, ObjectEntry, ObjectKind};
+use crate::manifest::{FileEntry, FileRole, Manifest, ObjectEntry, ObjectKind};
 use crate::pack::{digest_file, sanitize};
 
 /// Bytes read from a data file per `COPY` chunk.
@@ -166,19 +166,20 @@ impl Loader<'_> {
     /// or post-data file that is missing or corrupt fails its object now; a
     /// structure file is judged when it is applied (KB §5.4 step 5).
     fn check_files(&mut self) {
-        for object in &self.manifest.objects {
-            for file in &object.files {
-                let ok = match digest_file(&self.dir.join(&file.path)) {
-                    Ok((size, sha)) => size == file.size && sha == file.sha256,
-                    Err(_) => false,
-                };
-                self.intact.insert(file.path.clone(), ok);
-                if !ok && file.role != FileRole::Structure {
-                    self.fail(
-                        &object.name,
-                        format!("`{}` is missing or does not match the manifest", file.path),
-                    );
-                }
+        let entries: Vec<(String, FileEntry)> = self
+            .manifest
+            .objects
+            .iter()
+            .flat_map(|o| o.files.iter().map(move |f| (o.name.clone(), f.clone())))
+            .collect();
+        for (object, file) in entries {
+            let ok = file_intact(self.dir, &file);
+            self.intact.insert(file.path.clone(), ok);
+            if !ok && file.role != FileRole::Structure {
+                self.fail(
+                    &object,
+                    format!("`{}` is missing or does not match the manifest", file.path),
+                );
             }
         }
     }
@@ -324,6 +325,17 @@ impl Loader<'_> {
             }
         }
         self.outcome
+    }
+}
+
+/// Whether `file` exists under `dir` with the recorded size and digest.
+fn file_intact(dir: &Path, file: &FileEntry) -> bool {
+    match digest_file(&dir.join(&file.path)) {
+        Ok((size, sha)) => size == file.size && sha == file.sha256,
+        Err(e) => {
+            debug!(file = %file.path, error = %e, "archive file cannot be digested");
+            false
+        }
     }
 }
 
