@@ -382,6 +382,11 @@ Rules the Postgres loader applies (implementation notes for §5.4–5.6):
   triggers in `pg_trigger`, schemas and extensions by name); a kind it cannot
   look up falls back to the whole-target empty check. A stored backup is never
   downloaded before the target is proven empty.
+- The empty-target (or single-item absence) check is **repeated on the loading
+  connection** immediately before its first statement, so an object created
+  between the pre-transfer check and the load is refused rather than loaded
+  over. Arkstore cannot lock other sessions out of DDL: a restore target must
+  have no other writers while the restore runs.
 - The archive's `manifest.source` **and** `manifest.engine` must match the
   `--source` being restored.
 - Files present in the archive but absent from the manifest are logged and

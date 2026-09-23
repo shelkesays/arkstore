@@ -154,6 +154,17 @@ impl Manifest {
         Ok(())
     }
 
+    /// The one object of a single-item archive (schemas and extensions
+    /// aside), if this is one (KB §5.7).
+    pub fn single_item(&self) -> Option<&ObjectEntry> {
+        let mut items = self
+            .objects
+            .iter()
+            .filter(|o| !matches!(o.kind, ObjectKind::Schema | ObjectKind::Extension));
+        let first = items.next()?;
+        items.next().is_none().then_some(first)
+    }
+
     /// Every file path the manifest lists.
     pub fn file_paths(&self) -> impl Iterator<Item = &str> {
         self.objects
@@ -408,6 +419,24 @@ mod tests {
         assert!(m.validate().is_err());
         m.objects[0].content_hash = Some(format!("sum256:{}", "a".repeat(64)));
         assert!(m.validate().is_ok());
+    }
+
+    #[test]
+    fn single_item_ignores_schemas_and_extensions() {
+        let several = manifest(vec![object("a", &[]), object("b", &[])]);
+        assert!(several.single_item().is_none(), "several objects");
+        let one = manifest(vec![object("a", &[])]);
+        assert_eq!(one.single_item().map(|o| o.name.as_str()), Some("a"));
+        let mut schema = object("public", &[]);
+        schema.kind = ObjectKind::Schema;
+        let with_schema = manifest(vec![schema, object("a", &[])]);
+        assert_eq!(
+            with_schema.single_item().map(|o| o.name.as_str()),
+            Some("a")
+        );
+        let mut only_schema = object("public", &[]);
+        only_schema.kind = ObjectKind::Schema;
+        assert!(manifest(vec![only_schema]).single_item().is_none());
     }
 
     #[test]

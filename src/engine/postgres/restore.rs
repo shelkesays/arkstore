@@ -30,6 +30,10 @@ const COPY_CHUNK: usize = 1024 * 1024;
 /// with `CREATE EXTENSION IF NOT EXISTS`.
 pub async fn target_contents(target: &ResolvedTarget) -> Result<TargetContents> {
     let conn = Conn::connect_target(target).await?;
+    contents_on(&conn).await
+}
+
+async fn contents_on(conn: &Conn) -> Result<TargetContents> {
     let sql = format!(
         "WITH objs AS ( \
            SELECT n.nspname || '.' || c.relname AS name FROM pg_catalog.pg_class c \
@@ -161,6 +165,7 @@ pub async fn restore(
     manifest: &Manifest,
 ) -> Result<RestoreOutcome> {
     let conn = Conn::connect_target(target).await?;
+    ensure_still_admissible(&conn, manifest).await?;
     let mut loader = Loader {
         conn,
         dir,
@@ -172,27 +177,59 @@ pub async fn restore(
     };
     loader.check_files();
     loader.prepare_session().await?;
-    let order = ordered(manifest);
-    for object in &order {
+    run_phases(&mut loader, &ordered(manifest)).await;
+    Ok(loader.finish())
+}
+
+/// The pre-transfer check ran on another connection; repeat it on the
+/// loading connection right before its first statement, so anything that
+/// appeared in between is refused rather than loaded over. (Arkstore cannot
+/// lock other sessions out of DDL — a target must have no other writers.)
+async fn ensure_still_admissible(conn: &Conn, manifest: &Manifest) -> Result<()> {
+    if let Some(object) = manifest.single_item() {
+        match object_exists(conn, object).await? {
+            Some(true) => {
+                return Err(ArkError::Refused(format!(
+                    "`{}` appeared in the target before loading started — a single-item restore needs it absent",
+                    object.name
+                )))
+            }
+            Some(false) => return Ok(()),
+            None => {}
+        }
+    }
+    let contents = contents_on(conn).await?;
+    if contents.total == 0 {
+        return Ok(());
+    }
+    Err(ArkError::Refused(format!(
+        "target is no longer empty when loading starts: {} user objects, e.g. {}",
+        contents.total,
+        contents.sample.join(", ")
+    )))
+}
+
+/// Structure (triggers excepted), data, triggers, post-data, presence.
+async fn run_phases(loader: &mut Loader<'_>, order: &[&ObjectEntry]) {
+    for object in order {
         if object.kind != ObjectKind::Trigger {
             loader.apply_structure(object).await;
         }
     }
-    for object in &order {
+    for object in order {
         loader.load_data(object).await;
     }
-    for object in &order {
+    for object in order {
         if object.kind == ObjectKind::Trigger {
             loader.apply_structure(object).await;
         }
     }
-    for object in &order {
+    for object in order {
         loader.apply_post(object).await;
     }
-    for object in &order {
+    for object in order {
         loader.verify_presence(object).await;
     }
-    Ok(loader.finish())
 }
 
 /// Load-plan layers flattened, then the cyclic objects (their foreign keys

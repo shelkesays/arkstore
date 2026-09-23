@@ -21,7 +21,7 @@ use crate::error::{ArkError, Result};
 use crate::layout::{
     latest_key, parse_key, parse_stamp, source_prefix, versioned_key, versioned_prefix, BackupKind,
 };
-use crate::manifest::{Manifest, ObjectEntry, ObjectKind};
+use crate::manifest::{Manifest, ObjectEntry};
 use crate::pack::{ensure_headroom, unpack, UnpackReport};
 use crate::store::{ObjectInfo, Store};
 
@@ -139,7 +139,7 @@ async fn stage_local(
 /// Single-item archives need only their object absent; everything else
 /// needs an empty target.
 async fn guard_target(target: &ResolvedTarget, staged: Option<&Manifest>) -> Result<()> {
-    match staged.and_then(single_item) {
+    match staged.and_then(Manifest::single_item) {
         Some(object) => ensure_object_absent(target, object).await,
         None => ensure_target_empty(target).await,
     }
@@ -200,16 +200,6 @@ fn read_manifest(source: &Source, dest: &Path) -> Result<Manifest> {
         }
     }
     Ok(manifest)
-}
-
-/// The one object of a single-item archive (schemas and extensions aside).
-fn single_item(manifest: &Manifest) -> Option<&ObjectEntry> {
-    let mut items = manifest
-        .objects
-        .iter()
-        .filter(|o| !matches!(o.kind, ObjectKind::Schema | ObjectKind::Extension));
-    let first = items.next()?;
-    items.next().is_none().then_some(first)
 }
 
 /// Strict, engine-defined "empty" before any transfer (PRD §6.2 step 3).
