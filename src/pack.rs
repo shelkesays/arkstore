@@ -339,6 +339,7 @@ fn link_stays_inside(link_path: &Path, target: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
     fn make_tree(root: &Path) {
@@ -349,6 +350,7 @@ mod tests {
         std::fs::write(root.join(".DS_Store"), "junk").unwrap();
         std::fs::write(root.join("cache.tmp"), "junk").unwrap();
         std::fs::write(root.join("pg_internal"), "junk").unwrap();
+        #[cfg(unix)]
         symlink("a.txt", root.join("link-to-a")).unwrap();
     }
 
@@ -401,6 +403,7 @@ mod tests {
             std::fs::read_to_string(dest.join("sub/deeper/c.txt")).unwrap(),
             "gamma"
         );
+        #[cfg(unix)]
         assert!(
             dest.join("link-to-a").is_symlink(),
             "symlink preserved, not followed"
