@@ -12,7 +12,8 @@ use super::conn::{engine_err, Conn};
 use crate::error::{ArkError, Result};
 
 /// The user-schema filter shared by every query (`n` is `pg_namespace`).
-const USER_SCHEMA: &str = "n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') \
+pub(super) const USER_SCHEMA: &str =
+    "n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') \
     AND n.nspname NOT LIKE 'pg\\_temp\\_%' AND n.nspname NOT LIKE 'pg\\_toast\\_temp\\_%'";
 
 /// First OID a user-created object can have.
@@ -282,7 +283,7 @@ impl<'a> Cols<'a> {
     }
 }
 
-fn not_ext(class: &str, oid_expr: &str) -> String {
+pub(super) fn not_ext(class: &str, oid_expr: &str) -> String {
     format!(
         "NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend x WHERE x.classid = 'pg_catalog.{class}'::regclass \
          AND x.objid = {oid_expr} AND x.deptype = 'e')"

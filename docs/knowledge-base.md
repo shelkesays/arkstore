@@ -368,6 +368,45 @@ correctness-sensitive operation: preview-first, target-guarded, integrity-checke
    a failed object is recorded + skipped, never aborting the run.
 8. Emit a redacted `{restored, skipped, failed}` summary; temp dir always cleaned.
 
+Rules the Postgres loader applies (implementation notes for §5.4–5.6):
+
+- "Empty" ignores **extension-owned** objects: an installed extension belongs
+  to its extension, which the archive recreates with `CREATE EXTENSION IF NOT
+  EXISTS`. Everything else in a non-system schema — any relation kind,
+  function, or user type — makes the target non-empty.
+- A **local archive** (`--from <path>`) is unpacked before the empty check so a
+  **single-item** archive (one object besides schemas/extensions) can be
+  recognised; only then does the object-level "absent" rule apply — for every
+  kind the engine can look up (relations by `to_regclass`, types by
+  `to_regtype`, functions by `to_regprocedure` on their identity arguments,
+  triggers in `pg_trigger`, schemas and extensions by name); a kind it cannot
+  look up falls back to the whole-target empty check. A stored backup is never
+  downloaded before the target is proven empty.
+- The empty-target (or single-item absence) check is **repeated on the loading
+  connection** immediately before its first statement, so an object created
+  between the pre-transfer check and the load is refused rather than loaded
+  over. Arkstore cannot lock other sessions out of DDL: a restore target must
+  have no other writers while the restore runs.
+- The archive's `manifest.source` **and** `manifest.engine` must match the
+  `--source` being restored.
+- Files present in the archive but absent from the manifest are logged and
+  never loaded; the manifest is the authority.
+- Load phases: structure for every non-trigger object in load-plan order
+  (cyclic objects last — their foreign keys are post-data anyway), then every
+  data file by `COPY … FROM STDIN`, then **triggers** (created only after the
+  data so they never fire on the rows being loaded, whether or not
+  `session_replication_role = replica` was granted), then every `post.sql`.
+  Finally every table/view/matview/sequence is checked to exist.
+- Each table's data load is one transaction: a `COPY` error or a row count
+  that differs from the manifest's `row_count` rolls it back, so a failed
+  object leaves no rows behind. A failed object is skipped in every later
+  phase; nothing aborts the run. The same existence lookups run after the load
+  for every object the engine can look up.
+- `objects[].name` is split at its **first** dot into `schema.object`.
+- `skipped` = listed in the manifest but with nothing to apply (for example a
+  structure-less, data-skipped table); `restored` = at least one file applied
+  and every check passed.
+
 ### 5.5 Foreign-key ordering
 
 - Load order comes from the **dependency graph recorded in the manifest** (read
@@ -484,8 +523,10 @@ rejected up front.
 ### 6.3 Targets (`targets.yaml`, optional)
 
 Named restore targets: DBs `name`, `host`, `db`, `user`, password-via-secret,
-optional `port` and mongo `auth_db`; file `name`, `path`. Missing file is fine;
-targets may be inline (`restore.target`) or fully overridden by CLI/env (§5.2).
+optional `port`, `tls` / `tls_ca_file` (same values and meaning as a source's),
+mongo `auth_db`, and `ephemeral` (§12); file `name`, `path`. Missing file is
+fine; targets may be inline (`restore.target`) or fully overridden by CLI/env
+(§5.2).
 
 ### 6.4 Precedence & secrets
 

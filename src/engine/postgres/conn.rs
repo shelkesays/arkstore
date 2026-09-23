@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use futures::TryStreamExt;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
@@ -15,14 +16,15 @@ use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio::task::JoinHandle;
 use tokio_postgres::config::SslMode;
 use tokio_postgres::types::ToSql;
-use tokio_postgres::{Client, Config as PgConfig, CopyOutStream, NoTls, Row};
+use tokio_postgres::{Client, Config as PgConfig, CopyInSink, CopyOutStream, NoTls, Row};
 use tokio_postgres_rustls::MakeRustlsConnect;
 use tracing::{debug, warn};
 
 use super::sql::escape;
-use crate::config::{Source, TlsMode};
+use crate::config::{ResolvedTarget, Source, TlsMode};
 use crate::error::{ArkError, Result};
 use crate::redact::redact;
+use crate::secrets::Secret;
 
 /// Oldest server this backend dumps (PRD §5.1.4).
 pub const MIN_SERVER_VERSION_NUM: i32 = 130_000;
@@ -41,6 +43,45 @@ pub const SESSION_SETTINGS: &[(&str, &str)] = &[
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Everything needed to open one connection — from a source (dump) or a
+/// resolved target (restore / verify).
+#[derive(Debug, Clone)]
+pub struct ConnParams<'a> {
+    pub host: &'a str,
+    pub port: u16,
+    pub user: &'a str,
+    pub database: &'a str,
+    pub password: Option<&'a Secret>,
+    pub tls: TlsMode,
+    pub tls_ca_file: Option<&'a str>,
+}
+
+impl<'a> ConnParams<'a> {
+    pub fn source(source: &'a Source) -> Self {
+        Self {
+            host: source.host.as_deref().unwrap_or("localhost"),
+            port: source.port(),
+            user: source.user.as_deref().unwrap_or("postgres"),
+            database: source.database(),
+            password: source.password.as_ref(),
+            tls: source.tls,
+            tls_ca_file: source.tls_ca_file.as_deref(),
+        }
+    }
+
+    pub fn target(target: &'a ResolvedTarget) -> Self {
+        Self {
+            host: target.host.as_deref().unwrap_or("localhost"),
+            port: target.port,
+            user: target.user.as_deref().unwrap_or("postgres"),
+            database: target.database.as_deref().unwrap_or(&target.name),
+            password: target.password.as_ref(),
+            tls: target.tls,
+            tls_ca_file: target.tls_ca_file.as_deref(),
+        }
+    }
+}
+
 /// A live connection plus the version it reported.
 pub struct Conn {
     client: Client,
@@ -56,12 +97,21 @@ impl Drop for Conn {
 }
 
 impl Conn {
-    /// Connect, gate the version, and pin the session settings.
+    /// Connect to a source, gate the version, and pin the session settings.
     pub async fn connect(source: &Source) -> Result<Self> {
-        let config = pg_config(source);
-        let (client, driver) = match source.tls {
+        Self::connect_with(&ConnParams::source(source)).await
+    }
+
+    /// Connect to a restore / verify target the same way.
+    pub async fn connect_target(target: &ResolvedTarget) -> Result<Self> {
+        Self::connect_with(&ConnParams::target(target)).await
+    }
+
+    async fn connect_with(params: &ConnParams<'_>) -> Result<Self> {
+        let config = pg_config(params);
+        let (client, driver) = match params.tls {
             TlsMode::Disable => connect_plain(&config).await?,
-            mode => connect_tls(&config, mode, source.tls_ca_file.as_deref()).await?,
+            mode => connect_tls(&config, mode, params.tls_ca_file).await?,
         };
         let mut conn = Self {
             client,
@@ -101,6 +151,14 @@ impl Conn {
             .copy_out(sql)
             .await
             .map_err(|e| engine_err("COPY failed", e))
+    }
+
+    /// Start `COPY … FROM STDIN` and hand back the sink to feed.
+    pub async fn copy_in(&self, sql: &str) -> Result<CopyInSink<Bytes>> {
+        self.client
+            .copy_in(sql)
+            .await
+            .map_err(|e| engine_err("COPY FROM failed", e))
     }
 
     /// Open the source-wide read-only `REPEATABLE READ` transaction and
@@ -172,21 +230,21 @@ impl Conn {
     }
 }
 
-fn pg_config(source: &Source) -> PgConfig {
+fn pg_config(params: &ConnParams<'_>) -> PgConfig {
     let mut config = PgConfig::new();
     config
-        .host(source.host.as_deref().unwrap_or("localhost"))
-        .port(source.port())
-        .user(source.user.as_deref().unwrap_or("postgres"))
-        .dbname(source.database())
+        .host(params.host)
+        .port(params.port)
+        .user(params.user)
+        .dbname(params.database)
         .application_name("arkstore")
         .connect_timeout(CONNECT_TIMEOUT)
-        .ssl_mode(match source.tls {
+        .ssl_mode(match params.tls {
             TlsMode::Disable => SslMode::Disable,
             TlsMode::Prefer => SslMode::Prefer,
             TlsMode::Require | TlsMode::VerifyFull => SslMode::Require,
         });
-    if let Some(password) = &source.password {
+    if let Some(password) = params.password {
         config.password(password.expose());
     }
     config

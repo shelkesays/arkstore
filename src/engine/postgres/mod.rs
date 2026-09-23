@@ -7,7 +7,9 @@ mod catalog;
 mod conn;
 mod ddl;
 mod dump;
+mod restore;
 mod sql;
 
 pub use conn::{MIN_SERVER_VERSION_NUM, SESSION_SETTINGS};
 pub use dump::{dump, preview};
+pub use restore::{restore, target_contents, target_defines};

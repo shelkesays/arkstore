@@ -410,7 +410,8 @@ sub-action style, not a `--action` flag.)
 3. **Prove the target is empty before downloading or extracting** (a non-empty target aborts
    early, before any transfer), unless it is a local single-dump restore. "Empty" is engine-defined
    and strict — **Postgres:** no relations, views, sequences, functions, or types in any non-system
-   schema (anything outside `pg_catalog`, `information_schema`, `pg_toast`); **MySQL:** no tables,
+   schema (anything outside `pg_catalog`, `information_schema`, `pg_toast`; extension-owned
+   objects do not count — they belong to their extension, which the archive recreates); **MySQL:** no tables,
    views, routines, triggers, or events in the target database; **Mongo:** no collections in the
    target database (system collections excluded); **file:** the target directory is absent or has
    no entries.
@@ -459,9 +460,10 @@ supported — file restores go through the full-tree path.)
 - **PostgreSQL** — apply each object's `schema.sql` over the driver (with
   `check_function_bodies = off` for the session: a string-bodied SQL function may reference
   relations created later, and the catalog records no dependency for it — the same setting
-  `pg_dump` output relies on), then stream its `data.copy` via `COPY … FROM STDIN`; apply every
-  `post.sql` (foreign keys, materialized-view refresh) after all data; restore sequence values
-  last. Constraint-trigger suppression
+  `pg_dump` output relies on), then stream its `data.copy` via `COPY … FROM STDIN`; create
+  triggers only after all data is loaded (so they never fire on the rows being restored); apply
+  every `post.sql` (foreign keys, materialized-view refresh) after all data; restore sequence
+  values last. Constraint-trigger suppression
   (`SET session_replication_role = replica`) is attempted for speed and FK-cycle tolerance, with
   **retry-with-fallback**: if a permission error blocks it, the load is retried once without it
   rather than failing.

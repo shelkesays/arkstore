@@ -98,6 +98,8 @@ targets:
     host: staging.internal
     db: appdb
     user: restore
+    # tls: verify-full        # disable | prefer | require | verify-full (same as sources)
+    # tls_ca_file: /etc/ssl/certs/staging-ca.pem
     ephemeral: false          # true = verify may use it as-is (never dropped)
 
 # Inline fallback when no `targets` entry matches.

@@ -9,6 +9,7 @@ use serde::Deserialize;
 use tracing::warn;
 
 use crate::config::name::validate_name;
+use crate::config::TlsMode;
 use crate::config::{Config, Source, SourceType};
 use crate::error::{ArkError, Result};
 use crate::secrets::Secret;
@@ -49,6 +50,12 @@ pub struct Target {
     /// A throwaway target `verify` may use as-is (never dropped by Arkstore).
     #[serde(default)]
     pub ephemeral: bool,
+    /// TLS mode for database targets (same values as a source's `tls`).
+    #[serde(default)]
+    pub tls: TlsMode,
+    /// Optional CA bundle (PEM) for `verify-full`.
+    #[serde(default)]
+    pub tls_ca_file: Option<String>,
 }
 
 impl Target {
@@ -102,6 +109,8 @@ pub struct ResolvedTarget {
     pub auth_db: Option<String>,
     pub path: Option<String>,
     pub ephemeral: bool,
+    pub tls: TlsMode,
+    pub tls_ca_file: Option<String>,
 }
 
 /// Resolve the target for `source` (PRD §6.2 two-stage precedence).
@@ -132,6 +141,8 @@ pub fn resolve_target(
         auth_db: entry.auth_db.clone(),
         path: pick(&overrides.path, ENV_TARGET_PATH, &entry.path),
         ephemeral: entry.ephemeral,
+        tls: entry.tls,
+        tls_ca_file: entry.tls_ca_file.clone(),
     };
     require_fields(&resolved)?;
     Ok(resolved)
@@ -471,6 +482,8 @@ mod tests {
             auth_db: None,
             path: None,
             ephemeral: false,
+            tls: TlsMode::default(),
+            tls_ca_file: None,
         };
         assert!(check_not_production(&s, &t).is_err());
         t.database = Some("appdb_staging".into());

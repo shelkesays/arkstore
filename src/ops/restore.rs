@@ -1,22 +1,27 @@
 //! Restore: reconstruct one source from a chosen backup into a target.
 //!
-//! `list-backups` and file-tree restore are complete here; database restore
-//! needs the engine loaders (M0-4).
+//! `list-backups`, file-tree restore, and database restore through the native
+//! engine loaders (KB §5): target guard, strict empty-target check before any
+//! transfer, safe extraction, manifest validation, load-plan order, per-object
+//! failure isolation, and a `{restored, skipped, failed}` summary.
 
 use std::path::{Path, PathBuf};
 
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::cli::RestoreAction;
 use crate::config::{
     check_not_production, resolve_target, Config, ProcessEnv, ResolvedTarget, Source, SourceType,
     TargetOverrides,
 };
-use crate::engine::ensure_engine;
+use crate::engine::{
+    ensure_engine, restore_database, target_contents, target_defines, RestoreOutcome,
+};
 use crate::error::{ArkError, Result};
 use crate::layout::{
     latest_key, parse_key, parse_stamp, source_prefix, versioned_key, versioned_prefix, BackupKind,
 };
+use crate::manifest::{Manifest, ObjectEntry};
 use crate::pack::{ensure_headroom, unpack, UnpackReport};
 use crate::store::{ObjectInfo, Store};
 
@@ -56,12 +61,197 @@ pub async fn run_with_store(
                 SourceType::File => {
                     restore_file_source(config, store, source, &target, &request.from, dry_run)
                         .await
+                        .map(|()| vec![])
                 }
-                _ => Err(ArkError::NotImplemented("database restore backend (M0-4)")),
+                _ => {
+                    restore_database_source(config, store, source, &target, &request.from, dry_run)
+                        .await
+                }
             }
-            .map(|_| vec![])
         }
     }
+}
+
+/// Database restore (KB §5.4). Returns the source name when any object
+/// failed, so the run exits `1` while every other object still landed.
+async fn restore_database_source(
+    config: &Config,
+    store: &Store,
+    source: &Source,
+    target: &ResolvedTarget,
+    from: &str,
+    dry_run: bool,
+) -> Result<Vec<String>> {
+    let selection = select_backup(config, source, from)?;
+    let work = tempfile::tempdir()?;
+    let extract = work.path().join("extract");
+    let staged = stage_local(source, &selection, &extract).await?;
+    guard_target(target, staged.as_ref()).await?;
+    if dry_run {
+        return report_database_dry_run(store, source, target, &selection, staged.as_ref()).await;
+    }
+    let manifest = match staged {
+        Some(manifest) => manifest,
+        None => fetch_and_unpack(store, source, &selection, work.path(), &extract).await?,
+    };
+    let outcome = restore_database(target, &extract, &manifest).await?;
+    Ok(summarise(source, target, &outcome))
+}
+
+/// Log the `{restored, skipped, failed}` summary; the source name comes back
+/// when anything failed so the run exits `1`.
+fn summarise(source: &Source, target: &ResolvedTarget, outcome: &RestoreOutcome) -> Vec<String> {
+    for (object, reason) in &outcome.failed {
+        warn!(source = %source.name, target = %target.name, object, reason, "object failed");
+    }
+    info!(
+        source = %source.name,
+        target = %target.name,
+        restored = outcome.restored.len(),
+        skipped = outcome.skipped.len(),
+        failed = outcome.failed.len(),
+        "database restore finished"
+    );
+    if outcome.failed.is_empty() {
+        vec![]
+    } else {
+        vec![source.name.clone()]
+    }
+}
+
+/// A local archive is unpacked first so a single-item archive can be
+/// recognised; a stored backup is only fetched once the target is proven
+/// empty (PRD §6.2 step 3).
+async fn stage_local(
+    source: &Source,
+    selection: &BackupSelection,
+    extract: &Path,
+) -> Result<Option<Manifest>> {
+    match selection {
+        BackupSelection::LocalFile(path) => {
+            unpack_into(source, path, extract).await?;
+            read_manifest(source, extract).map(Some)
+        }
+        BackupSelection::Object(_) => Ok(None),
+    }
+}
+
+/// Single-item archives need only their object absent; everything else
+/// needs an empty target.
+async fn guard_target(target: &ResolvedTarget, staged: Option<&Manifest>) -> Result<()> {
+    match staged.and_then(Manifest::single_item) {
+        Some(object) => ensure_object_absent(target, object).await,
+        None => ensure_target_empty(target).await,
+    }
+}
+
+async fn fetch_and_unpack(
+    store: &Store,
+    source: &Source,
+    selection: &BackupSelection,
+    work: &Path,
+    extract: &Path,
+) -> Result<Manifest> {
+    let (archive, _) = fetch_selection(store, source, selection, work, extract, false)
+        .await?
+        .ok_or_else(|| ArkError::Internal("fetch returned nothing outside a dry run".into()))?;
+    unpack_into(source, &archive, extract).await?;
+    read_manifest(source, extract)
+}
+
+/// Safe-extract `archive` into `dest`; any refused entry fails the restore.
+async fn unpack_into(source: &Source, archive: &Path, dest: &Path) -> Result<()> {
+    let size = std::fs::metadata(archive)?.len();
+    let parent = dest.parent().map(Path::to_path_buf).unwrap_or_default();
+    ensure_headroom(&parent, size)?;
+    let (archive, dest_owned) = (archive.to_path_buf(), dest.to_path_buf());
+    let report = tokio::task::spawn_blocking(move || unpack(&archive, &dest_owned))
+        .await
+        .map_err(|e| ArkError::Internal(format!("extraction task failed: {e}")))??;
+    if !report.skipped.is_empty() {
+        return Err(refused_entries(source, dest, &report));
+    }
+    Ok(())
+}
+
+/// Read and validate `manifest.json`, check it belongs to this source, and
+/// warn about files the manifest does not list (never loaded, KB §2.5).
+fn read_manifest(source: &Source, dest: &Path) -> Result<Manifest> {
+    let manifest = Manifest::from_json(&std::fs::read(dest.join("manifest.json"))?)?;
+    if manifest.source != source.name {
+        return Err(ArkError::Refused(format!(
+            "archive was taken from source `{}`, not `{}`",
+            manifest.source, source.name
+        )));
+    }
+    if manifest.engine != source.source_type {
+        return Err(ArkError::Refused(format!(
+            "archive was taken from a {} source, but `{}` is {}",
+            manifest.engine.display_name(),
+            source.name,
+            source.source_type.display_name()
+        )));
+    }
+    let listed: std::collections::HashSet<&str> = manifest.file_paths().collect();
+    for entry in std::fs::read_dir(dest)? {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        if name != "manifest.json" && !listed.contains(name.as_str()) {
+            warn!(source = %source.name, file = %name, "archive file not listed in the manifest; never loaded");
+        }
+    }
+    Ok(manifest)
+}
+
+/// Strict, engine-defined "empty" before any transfer (PRD §6.2 step 3).
+async fn ensure_target_empty(target: &ResolvedTarget) -> Result<()> {
+    let contents = target_contents(target).await?;
+    if contents.total == 0 {
+        return Ok(());
+    }
+    Err(ArkError::Refused(format!(
+        "target `{}` ({}) is not empty: {} user objects, e.g. {} — restore only writes into an empty target",
+        target.name,
+        target.database.as_deref().unwrap_or("?"),
+        contents.total,
+        contents.sample.join(", ")
+    )))
+}
+
+/// Single-item rule: the one object must be absent from the target.
+/// Single-item rule: the one object must be absent from the target. A kind
+/// the engine cannot look up falls back to the whole-target empty check.
+async fn ensure_object_absent(target: &ResolvedTarget, object: &ObjectEntry) -> Result<()> {
+    match target_defines(target, object).await? {
+        Some(true) => Err(ArkError::Refused(format!(
+            "target `{}` already defines `{}` — a single-item restore needs it absent",
+            target.name, object.name
+        ))),
+        Some(false) => Ok(()),
+        None => ensure_target_empty(target).await,
+    }
+}
+
+async fn report_database_dry_run(
+    store: &Store,
+    source: &Source,
+    target: &ResolvedTarget,
+    selection: &BackupSelection,
+    staged: Option<&Manifest>,
+) -> Result<Vec<String>> {
+    match selection {
+        BackupSelection::Object(key) => {
+            let meta = store.head(key).await?;
+            info!(source = %source.name, target = %target.name, key, size = meta.size, "dry run: target is empty; would download, extract and load");
+        }
+        BackupSelection::LocalFile(path) => {
+            let objects = staged.map(|m| m.objects.len()).unwrap_or_default();
+            let layers = staged
+                .map(|m| m.load_plan().layers.len())
+                .unwrap_or_default();
+            info!(source = %source.name, target = %target.name, archive = %path.display(), objects, layers, "dry run: would load");
+        }
+    }
+    Ok(vec![])
 }
 
 /// List the versioned backups for `source`, newest first.
