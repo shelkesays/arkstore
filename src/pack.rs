@@ -310,7 +310,9 @@ fn is_safe_relative(path: &Path) -> bool {
 /// Whether `target`, resolved lexically against the link's parent directory,
 /// stays inside the extraction root.
 fn link_stays_inside(link_path: &Path, target: &Path) -> bool {
-    if target.is_absolute()
+    // `has_root` rather than `is_absolute`: on Windows `/etc/passwd` has a
+    // root but no drive prefix, and must still count as escaping.
+    if target.has_root()
         || target
             .components()
             .any(|c| matches!(c, Component::Prefix(_)))
