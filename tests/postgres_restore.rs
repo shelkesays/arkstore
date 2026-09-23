@@ -12,7 +12,7 @@ use std::path::Path;
 use arkstore::cli::RestoreAction;
 use arkstore::config::{Config, TargetOverrides};
 use arkstore::ops::{backup, restore, RestoreRequest};
-use arkstore::pack::{pack_dir, unpack};
+use arkstore::pack::{digest_file, pack_dir, unpack};
 use arkstore::store::Store;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -230,8 +230,25 @@ async fn restore_recreates_the_database_from_the_manifest() -> TestResult {
     Ok(())
 }
 
-/// Take the stored archive apart, corrupt one data file, put it back together.
+/// Take the stored archive apart, add a row to one data file, and rewrite the
+/// manifest's size and digest for it so the file passes the integrity check
+/// and the mismatch surfaces at load time as a row-count difference.
 async fn tamper_archive(
+    base: &Path,
+    store: &Store,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let work = unpack_stored_archive(base, store).await?;
+    let data = work.join("shop.scratch.data.copy");
+    let mut scratch = fs::read_to_string(&data)?;
+    scratch.push_str("zz\t9\n");
+    fs::write(&data, scratch)?;
+    patch_manifest_digest(&work, "shop.scratch.data.copy")?;
+    let tampered = base.join("tampered.tar.gz");
+    pack_dir(&work, &tampered)?;
+    Ok(tampered)
+}
+
+async fn unpack_stored_archive(
     base: &Path,
     store: &Store,
 ) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
@@ -241,12 +258,29 @@ async fn tamper_archive(
     store.download_to_file(&key, &original).await?;
     let work = base.join("work");
     unpack(&original, &work)?;
-    let mut scratch = fs::read_to_string(work.join("shop.scratch.data.copy"))?;
-    scratch.push_str("zz\t9\n");
-    fs::write(work.join("shop.scratch.data.copy"), scratch)?;
-    let tampered = base.join("tampered.tar.gz");
-    pack_dir(&work, &tampered)?;
-    Ok(tampered)
+    Ok(work)
+}
+
+/// Rewrite `size` / `sha256` of one file entry to the file's current bytes.
+fn patch_manifest_digest(work: &Path, file_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let (size, sha256) = digest_file(&work.join(file_path))?;
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(work.join("manifest.json"))?)?;
+    let objects = manifest["objects"].as_array_mut().ok_or("objects")?;
+    let files = objects
+        .iter_mut()
+        .filter_map(|o| o["files"].as_array_mut())
+        .flatten()
+        .filter(|f| f["path"] == file_path);
+    for file in files {
+        file["size"] = serde_json::json!(size);
+        file["sha256"] = serde_json::json!(sha256);
+    }
+    fs::write(
+        work.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest)?,
+    )?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -269,7 +303,8 @@ async fn a_corrupt_data_file_fails_only_its_object() -> TestResult {
         "one failed object exits 1"
     );
     check_restored_database(&t, &db).await?;
-    // A failed object is skipped in every phase, so the table was never created.
+    // The structure was applied, the COPY was rolled back on the count
+    // mismatch, so the table exists and holds nothing.
     assert_eq!(
         count(
             &t,
@@ -277,8 +312,12 @@ async fn a_corrupt_data_file_fails_only_its_object() -> TestResult {
             "SELECT count(*) FROM pg_class WHERE relname = 'scratch'"
         )
         .await?,
+        1
+    );
+    assert_eq!(
+        count(&t, &db, "SELECT count(*) FROM shop.scratch").await?,
         0,
-        "corrupt object never created"
+        "rows of a failed object are rolled back"
     );
     Ok(())
 }

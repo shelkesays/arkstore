@@ -60,27 +60,93 @@ pub async fn target_contents(target: &ResolvedTarget) -> Result<TargetContents> 
     Ok(contents)
 }
 
-/// Whether the target already defines relation `name` (`schema.object`).
-pub async fn target_defines(target: &ResolvedTarget, name: &str) -> Result<bool> {
+/// Whether the target already defines `object`; `None` when the kind cannot
+/// be looked up on this engine.
+pub async fn target_defines(target: &ResolvedTarget, object: &ObjectEntry) -> Result<Option<bool>> {
     let conn = Conn::connect_target(target).await?;
-    relation_exists(&conn, name).await
+    object_exists(&conn, object).await
 }
 
 async fn relation_exists(conn: &Conn, name: &str) -> Result<bool> {
     let (schema, object) = split_name(name);
-    let regclass = qualified(schema, object);
-    let rows = conn
-        .rows(
+    exists(
+        conn,
+        "SELECT pg_catalog.to_regclass($1) IS NOT NULL",
+        &[qualified(schema, object)],
+    )
+    .await
+}
+
+/// Existence lookup per object kind (KB §5.4): relations by `to_regclass`,
+/// types by `to_regtype`, functions by `to_regprocedure` on their identity
+/// arguments, triggers in `pg_trigger`, schemas and extensions by name.
+async fn object_exists(conn: &Conn, object: &ObjectEntry) -> Result<Option<bool>> {
+    let Some((sql, params)) = existence_query(object) else {
+        return Ok(None);
+    };
+    exists(conn, sql, &params).await.map(Some)
+}
+
+fn existence_query(object: &ObjectEntry) -> Option<(&'static str, Vec<String>)> {
+    let name = object.name.as_str();
+    let (schema, rest) = split_name(name);
+    Some(match object.kind {
+        ObjectKind::Table | ObjectKind::View | ObjectKind::Matview | ObjectKind::Sequence => (
             "SELECT pg_catalog.to_regclass($1) IS NOT NULL",
-            &[&regclass],
-        )
-        .await?;
+            vec![qualified(schema, rest)],
+        ),
+        ObjectKind::Type => (
+            "SELECT pg_catalog.to_regtype($1) IS NOT NULL",
+            vec![qualified(schema, rest)],
+        ),
+        ObjectKind::Function => {
+            // Manifest names carry the identity arguments exactly as
+            // `pg_get_function_identity_arguments` renders them.
+            let (function, args) = rest.split_once('(').unwrap_or((rest, ")"));
+            (
+                "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_proc p \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+                 WHERE n.nspname = $1 AND p.proname = $2 \
+                 AND pg_catalog.pg_get_function_identity_arguments(p.oid) = $3)",
+                vec![
+                    schema.to_string(),
+                    function.to_string(),
+                    args.trim_end_matches(')').to_string(),
+                ],
+            )
+        }
+        ObjectKind::Trigger => {
+            let (table, trigger) = rest.rsplit_once('.').unwrap_or((rest, ""));
+            (
+                "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger t \
+                 WHERE t.tgrelid = pg_catalog.to_regclass($1) AND t.tgname = $2 AND NOT t.tgisinternal)",
+                vec![qualified(schema, table), trigger.to_string()],
+            )
+        }
+        ObjectKind::Schema => (
+            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = $1)",
+            vec![name.to_string()],
+        ),
+        ObjectKind::Extension => (
+            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_extension WHERE extname = $1)",
+            vec![name.strip_prefix("extension:").unwrap_or(name).to_string()],
+        ),
+        ObjectKind::Collection | ObjectKind::MongoView => return None,
+    })
+}
+
+async fn exists(conn: &Conn, sql: &str, params: &[String]) -> Result<bool> {
+    let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+        .iter()
+        .map(|p| p as &(dyn tokio_postgres::types::ToSql + Sync))
+        .collect();
+    let rows = conn.rows(sql, &refs).await?;
     let row = rows.first().ok_or_else(|| ArkError::Engine {
         engine: "PostgreSQL",
-        message: "to_regclass returned no row".into(),
+        message: "existence query returned no row".into(),
     })?;
     row.try_get(0)
-        .map_err(|e| super::conn::engine_err("cannot read to_regclass", e))
+        .map_err(|e| super::conn::engine_err("cannot read existence query", e))
 }
 
 /// `schema.object` → (`schema`, `object`), split at the first dot (KB §2.5).
@@ -266,19 +332,43 @@ impl Loader<'_> {
         };
         let (schema, name) = split_name(&object.name);
         let table = qualified(schema, name);
-        match copy_in(&self.conn, &table, &self.dir.join(&file.path)).await {
-            Ok(rows) if Some(rows) == object.row_count || object.row_count.is_none() => {
-                self.applied.insert(object.name.clone());
-                debug!(object = %object.name, rows, "rows loaded");
+        if let Err(e) = self.conn.exec("BEGIN").await {
+            return self.fail(&object.name, e.to_string());
+        }
+        // The load is one transaction: a count mismatch or a COPY error rolls
+        // it back, so a failed object leaves no rows behind.
+        let verdict = match copy_in(&self.conn, &table, &self.dir.join(&file.path)).await {
+            Ok(rows) if Some(rows) == object.row_count || object.row_count.is_none() => Ok(rows),
+            Ok(rows) => Err(format!(
+                "loaded {rows} rows but the manifest recorded {}",
+                object.row_count.unwrap_or_default()
+            )),
+            Err(e) => Err(format!("`{}`: {e}", file.path)),
+        };
+        if let Err(reason) = &verdict {
+            self.fail(&object.name, reason.clone());
+        }
+        let committed = self.end_transaction(&object.name).await;
+        if let (Ok(rows), true) = (verdict, committed) {
+            self.applied.insert(object.name.clone());
+            debug!(object = %object.name, rows, "rows loaded");
+        }
+    }
+
+    /// Commit the data transaction, or roll it back when the object already
+    /// failed. Returns whether the object is still good.
+    async fn end_transaction(&mut self, object: &str) -> bool {
+        let statement = if self.failed.contains(object) {
+            "ROLLBACK"
+        } else {
+            "COMMIT"
+        };
+        match self.conn.exec(statement).await {
+            Ok(()) => !self.failed.contains(object),
+            Err(e) => {
+                self.fail(object, format!("{statement} failed: {e}"));
+                false
             }
-            Ok(rows) => self.fail(
-                &object.name,
-                format!(
-                    "loaded {rows} rows but the manifest recorded {}",
-                    object.row_count.unwrap_or_default()
-                ),
-            ),
-            Err(e) => self.fail(&object.name, format!("`{}`: {e}", file.path)),
         }
     }
 
@@ -297,18 +387,15 @@ impl Loader<'_> {
         }
     }
 
-    /// After loading, every relation-like object must exist (PRD §6.2 step 7).
+    /// After loading, every object the engine can look up must exist
+    /// (PRD §6.2 step 7).
     async fn verify_presence(&mut self, object: &ObjectEntry) {
-        let relation_like = matches!(
-            object.kind,
-            ObjectKind::Table | ObjectKind::View | ObjectKind::Matview | ObjectKind::Sequence
-        );
-        if self.is_failed(object) || !relation_like {
+        if self.is_failed(object) {
             return;
         }
-        match relation_exists(&self.conn, &object.name).await {
-            Ok(true) => {}
-            Ok(false) => self.fail(&object.name, "missing from the target after load".into()),
+        match object_exists(&self.conn, object).await {
+            Ok(Some(true)) | Ok(None) => {}
+            Ok(Some(false)) => self.fail(&object.name, "missing from the target after load".into()),
             Err(e) => self.fail(&object.name, e.to_string()),
         }
     }

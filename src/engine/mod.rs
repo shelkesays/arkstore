@@ -81,15 +81,19 @@ pub async fn target_contents(target: &ResolvedTarget) -> Result<TargetContents> 
     }
 }
 
-/// Whether `target` already defines the relation `name` (`schema.object`).
-pub async fn target_defines(target: &ResolvedTarget, name: &str) -> Result<bool> {
+/// Whether `target` already defines `object`; `None` when the engine cannot
+/// look that kind up (callers then fall back to the empty-target check).
+pub async fn target_defines(
+    target: &ResolvedTarget,
+    object: &crate::manifest::ObjectEntry,
+) -> Result<Option<bool>> {
     ensure_engine(target.kind)?;
     match target.kind {
         #[cfg(feature = "postgres")]
-        SourceType::Postgre => postgres::target_defines(target, name).await,
+        SourceType::Postgre => postgres::target_defines(target, object).await,
         _ => {
             tracing::debug!(
-                object = name,
+                object = %object.name,
                 "no native loader for this engine in this build"
             );
             Err(not_implemented_restore(target))

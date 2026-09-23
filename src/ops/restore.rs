@@ -184,6 +184,14 @@ fn read_manifest(source: &Source, dest: &Path) -> Result<Manifest> {
             manifest.source, source.name
         )));
     }
+    if manifest.engine != source.source_type {
+        return Err(ArkError::Refused(format!(
+            "archive was taken from a {} source, but `{}` is {}",
+            manifest.engine.display_name(),
+            source.name,
+            source.source_type.display_name()
+        )));
+    }
     let listed: std::collections::HashSet<&str> = manifest.file_paths().collect();
     for entry in std::fs::read_dir(dest)? {
         let name = entry?.file_name().to_string_lossy().into_owned();
@@ -220,18 +228,17 @@ async fn ensure_target_empty(target: &ResolvedTarget) -> Result<()> {
 }
 
 /// Single-item rule: the one object must be absent from the target.
+/// Single-item rule: the one object must be absent from the target. A kind
+/// the engine cannot look up falls back to the whole-target empty check.
 async fn ensure_object_absent(target: &ResolvedTarget, object: &ObjectEntry) -> Result<()> {
-    let relation_like = matches!(
-        object.kind,
-        ObjectKind::Table | ObjectKind::View | ObjectKind::Matview | ObjectKind::Sequence
-    );
-    if relation_like && target_defines(target, &object.name).await? {
-        return Err(ArkError::Refused(format!(
+    match target_defines(target, object).await? {
+        Some(true) => Err(ArkError::Refused(format!(
             "target `{}` already defines `{}` — a single-item restore needs it absent",
             target.name, object.name
-        )));
+        ))),
+        Some(false) => Ok(()),
+        None => ensure_target_empty(target).await,
     }
-    Ok(())
 }
 
 async fn report_database_dry_run(
