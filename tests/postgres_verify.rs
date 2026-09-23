@@ -188,14 +188,7 @@ fn tamper_manifest(
     unpack(original, &work)?;
     let mut manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(work.join("manifest.json"))?)?;
-    for object in manifest["objects"].as_array_mut().ok_or("objects")? {
-        if object["name"] == "shop.customers" {
-            object["row_count"] = serde_json::json!(99);
-        }
-        if object["name"] == "shop.mood" {
-            object["schema_hash"] = serde_json::json!(format!("sha256:{}", "0".repeat(64)));
-        }
-    }
+    corrupt_two_objects(&mut manifest)?;
     fs::write(
         work.join("manifest.json"),
         serde_json::to_vec_pretty(&manifest)?,
@@ -203,6 +196,17 @@ fn tamper_manifest(
     let tampered = base.join("tampered.tar.gz");
     pack_dir(&work, &tampered)?;
     Ok(tampered)
+}
+
+fn corrupt_two_objects(manifest: &mut serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
+    let objects = manifest["objects"].as_array_mut().ok_or("objects")?;
+    for object in objects.iter_mut().filter(|o| o["name"] == "shop.customers") {
+        object["row_count"] = serde_json::json!(99);
+    }
+    for object in objects.iter_mut().filter(|o| o["name"] == "shop.mood") {
+        object["schema_hash"] = serde_json::json!(format!("sha256:{}", "0".repeat(64)));
+    }
+    Ok(())
 }
 
 #[tokio::test]
