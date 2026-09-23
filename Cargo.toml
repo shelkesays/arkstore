@@ -2,7 +2,7 @@
 name = "arkstore"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.89"
 license = "MIT"
 description = "Backup, restore, retention-cleanup, and cold-tier archival for databases and files to object storage."
 repository = "https://github.com/shelkesays/arkstore"
@@ -12,7 +12,11 @@ keywords = ["backup", "restore", "archive", "s3", "database"]
 categories = ["command-line-utilities", "database"]
 
 [dependencies]
-chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+chrono = { version = "0.4", default-features = false, features = [
+  "clock",
+  "std",
+  "serde",
+] }
 chrono-tz = "0.10"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -20,7 +24,13 @@ serde_json = "1"
 serde_yaml = "0.9"
 sha2 = "0.11"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs", "io-util"] }
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "signal",
+  "fs",
+  "io-util",
+] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zeroize = { version = "1", features = ["derive"] }
@@ -35,14 +45,23 @@ futures = "0.3"
 #   reqwest:      rustls-no-provider   (rustls without a bundled provider)
 #   rustls:       ring                 (installed as the process default in main)
 object_store = { version = "0.14", features = ["aws-base", "reqwest", "ring"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+reqwest = { version = "0.13", default-features = false, features = [
+  "rustls-no-provider",
+] }
+rustls = { version = "0.23", default-features = false, features = [
+  "ring",
+  "std",
+  "tls12",
+  "logging",
+] }
 tar = "0.4"
 tempfile = "3"
 # M0-3: native Postgres backend (feature `postgres`). TLS is rustls with the
 # same `ring` provider the S3 client uses; roots come from Mozilla's bundle
 # (already in the tree via reqwest) or the source's `tls_ca_file`.
-tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"], optional = true }
+tokio-postgres = { version = "0.7", default-features = false, features = [
+  "runtime",
+], optional = true }
 tokio-postgres-rustls = { version = "0.14", optional = true }
 rustls-pki-types = { version = "1", features = ["std"], optional = true }
 webpki-root-certs = { version = "1", optional = true }
@@ -59,7 +78,12 @@ ignored = ["reqwest"]
 default = ["postgres", "archive", "files"]
 # Engine drivers become optional dependencies behind these features as each
 # backend lands (M0-3: tokio-postgres; M3: mysql_async, mongodb).
-postgres = ["dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:rustls-pki-types", "dep:webpki-root-certs"]
+postgres = [
+  "dep:tokio-postgres",
+  "dep:tokio-postgres-rustls",
+  "dep:rustls-pki-types",
+  "dep:webpki-root-certs",
+]
 mysql = []
 mongo = []
 archive = []
