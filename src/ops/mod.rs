@@ -13,4 +13,4 @@ pub use cleanup::{run as cleanup, CleanupAction};
 pub use restore::{
     list_backups, run as restore, run_with_store as restore_with_store, RestoreRequest,
 };
-pub use verify::{run as verify, VerifyRequest};
+pub use verify::{run as verify, run_with_store as verify_with_store, VerifyRequest};

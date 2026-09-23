@@ -583,6 +583,9 @@ Verification proves a backup is restorable — the safety net that makes native 
     content hash** matches the value recorded in the snapshot.
 - **Report** `{verified, mismatched, failed}` per object with reasons; exit `1` on any mismatch.
 - **Tear down** the throwaway target only if Arkstore created it; never touch a pre-existing one.
+  The created name is `arkstore_verify_<source>_<stamp>` (source lowercased and cut to 24
+  characters, the verify run's stamp), created and dropped through `verify.server`'s own database;
+  Ctrl-C during a verify still drops it. Target precedence and the comparison rules are in KB §12.
 
 `verify` runs on demand and in CI against containerized engines for every backend, gating the
 fidelity contract (§5.1.2). `--dry-run` reports what would be verified without restoring.

@@ -17,11 +17,16 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     init_tracing(cli.log_level.as_deref());
 
-    // Ctrl-C cancels in-flight work cooperatively; ops clean up via Drop
-    // guards and the process exits 130 (PRD §9.6).
-    let outcome = tokio::select! {
-        result = run(&cli) => result,
-        _ = tokio::signal::ctrl_c() => Err(ArkError::Interrupted),
+    // Ctrl-C cancels in-flight work cooperatively and the process exits 130
+    // (PRD §9.6). `verify` owns a database it must drop on interrupt, so it
+    // watches for Ctrl-C itself and is not raced here.
+    let outcome = if matches!(cli.command, Command::Verify { .. }) {
+        run(&cli).await
+    } else {
+        tokio::select! {
+            result = run(&cli) => result,
+            _ = tokio::signal::ctrl_c() => Err(ArkError::Interrupted),
+        }
     };
 
     match outcome {
