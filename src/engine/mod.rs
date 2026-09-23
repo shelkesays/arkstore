@@ -118,6 +118,72 @@ pub async fn restore_database(
     }
 }
 
+/// What `verify` found, per manifest object (PRD §6.5).
+#[derive(Debug, Clone, Default)]
+pub struct VerifyOutcome {
+    pub verified: Vec<String>,
+    /// `(object, reason)` — exists but differs, missing, or not in the manifest.
+    pub mismatched: Vec<(String, String)>,
+    /// `(object, reason)` — the comparison itself could not be made.
+    pub failed: Vec<(String, String)>,
+}
+
+impl VerifyOutcome {
+    pub fn is_clean(&self) -> bool {
+        self.mismatched.is_empty() && self.failed.is_empty()
+    }
+}
+
+/// Re-introspect `target` (restored from `manifest`) and compare it with the
+/// manifest baseline on both axes: definitions and data.
+pub async fn verify_database(
+    source: &Source,
+    target: &ResolvedTarget,
+    manifest: &Manifest,
+) -> Result<VerifyOutcome> {
+    ensure_engine(target.kind)?;
+    match target.kind {
+        #[cfg(feature = "postgres")]
+        SourceType::Postgre => postgres::verify(source, target, manifest).await,
+        _ => {
+            tracing::debug!(source = %source.name, objects = manifest.objects.len(), "no native verifier for this engine in this build");
+            Err(not_implemented_restore(target))
+        }
+    }
+}
+
+/// Create the throwaway database `name` on `server` (KB §12).
+pub async fn create_database(server: &ResolvedTarget, name: &str) -> Result<()> {
+    ensure_engine(server.kind)?;
+    match server.kind {
+        #[cfg(feature = "postgres")]
+        SourceType::Postgre => postgres::create_database(server, name).await,
+        _ => {
+            tracing::debug!(
+                database = name,
+                "no native verifier for this engine in this build"
+            );
+            Err(not_implemented_restore(server))
+        }
+    }
+}
+
+/// Drop a database Arkstore created. Never called for one it did not.
+pub async fn drop_database(server: &ResolvedTarget, name: &str) -> Result<()> {
+    ensure_engine(server.kind)?;
+    match server.kind {
+        #[cfg(feature = "postgres")]
+        SourceType::Postgre => postgres::drop_database(server, name).await,
+        _ => {
+            tracing::debug!(
+                database = name,
+                "no native verifier for this engine in this build"
+            );
+            Err(not_implemented_restore(server))
+        }
+    }
+}
+
 fn not_implemented_restore(target: &ResolvedTarget) -> ArkError {
     tracing::debug!(target = %target.name, kind = ?target.kind, "restore requested");
     ArkError::NotImplemented("database restore backend for this engine (M3)")

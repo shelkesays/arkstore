@@ -27,7 +27,7 @@ use crate::pack::digest_file;
 
 /// Which catalog entry an object comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum What {
+pub(super) enum What {
     Schema(usize),
     Extension(usize),
     Type(usize),
@@ -37,20 +37,20 @@ enum What {
     Trigger(usize),
 }
 
-/// One object to dump.
+/// One object to dump (or, for `verify`, to re-introspect).
 #[derive(Debug, Clone)]
-struct Item {
-    name: String,
-    kind: ObjectKind,
-    stem: String,
-    what: What,
+pub(super) struct Item {
+    pub(super) name: String,
+    pub(super) kind: ObjectKind,
+    pub(super) stem: String,
+    pub(super) what: What,
     /// Table data is skipped (`ignore`) — structure only.
-    data_skipped: bool,
+    pub(super) data_skipped: bool,
 }
 
 /// The objects to dump, after ignore rules, plus lookups for dependencies.
-struct Plan {
-    items: Vec<Item>,
+pub(super) struct Plan {
+    pub(super) items: Vec<Item>,
     /// (`pg_class` | `pg_type` | `pg_proc` | `pg_namespace` | `pg_trigger`, oid) → item.
     index: HashMap<(&'static str, u32), usize>,
 }
@@ -146,7 +146,7 @@ fn log_unsupported(source: &Source, catalog: &Catalog) {
     }
 }
 
-fn rel_names(catalog: &Catalog) -> HashMap<u32, String> {
+pub(super) fn rel_names(catalog: &Catalog) -> HashMap<u32, String> {
     catalog
         .relations
         .iter()
@@ -185,7 +185,7 @@ impl Rules {
 }
 
 impl Plan {
-    fn build(source: &Source, catalog: &Catalog) -> Self {
+    pub(super) fn build(source: &Source, catalog: &Catalog) -> Self {
         let rules = Rules::from_source(source);
         let mut plan = Self {
             items: Vec::new(),
@@ -449,7 +449,7 @@ fn sanitize(name: &str) -> String {
     format!("{mapped}-{}", digest.get(..8).unwrap_or_default())
 }
 
-fn script_for(item: &Item, emitter: &Emitter<'_>) -> Script {
+pub(super) fn script_for(item: &Item, emitter: &Emitter<'_>) -> Script {
     let c = emitter.catalog;
     match item.what {
         What::Schema(i) => emitter.schema(&c.schemas[i]),
@@ -594,6 +594,28 @@ async fn copy_table(
     out.flush().await?;
     drop(out);
     Ok((file_entry(&path, name, FileRole::Data)?, sum))
+}
+
+/// Stream `COPY table TO STDOUT` through the content hash without keeping
+/// the bytes — what `verify` does to a restored table (KB §12).
+pub(super) async fn hash_table(conn: &Conn, table: &str) -> Result<Sum256> {
+    let stream = conn
+        .copy_out(&format!("COPY {table} TO STDOUT (FORMAT text)"))
+        .await?;
+    let mut stream = std::pin::pin!(stream);
+    let mut sum = Sum256::new();
+    let mut pending: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream
+        .try_next()
+        .await
+        .map_err(|e| super::conn::engine_err("COPY stream failed", e))?
+    {
+        fold_lines(&chunk, &mut pending, &mut sum);
+    }
+    if !pending.is_empty() {
+        sum.add_row(&pending);
+    }
+    Ok(sum)
 }
 
 /// Split `chunk` on newlines, completing any partial line carried in

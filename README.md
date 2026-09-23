@@ -141,7 +141,7 @@ The site is built from `guide/` (which includes `PRD.md` and
 
 ## Roadmap
 
-- **M0** — CLI, config/secrets, object-store abstraction, native Postgres backup + restore, first `verify`. *(in progress)*
+- **M0** — CLI, config/secrets, object-store abstraction, native Postgres backup + restore, first `verify`. *(complete)*
 - **M1** — full cleanup: retention model, plan/execute/consolidate, audit trail.
 - **M2** — archive: Postgres engine, Parquet writer, whole-months policy.
 - **M3** — native MySQL + Mongo backup/restore/archive; file sources; `verify` for each.

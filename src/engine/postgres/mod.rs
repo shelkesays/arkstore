@@ -9,7 +9,9 @@ mod ddl;
 mod dump;
 mod restore;
 mod sql;
+mod verify;
 
 pub use conn::{MIN_SERVER_VERSION_NUM, SESSION_SETTINGS};
 pub use dump::{dump, preview};
 pub use restore::{restore, target_contents, target_defines};
+pub use verify::{create_database, drop_database, verify};

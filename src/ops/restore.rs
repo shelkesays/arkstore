@@ -72,6 +72,13 @@ pub async fn run_with_store(
     }
 }
 
+/// What a database restore produced: the manifest it loaded from and the
+/// per-object outcome. `verify` compares the target against the manifest.
+pub(crate) struct DatabaseRestore {
+    pub manifest: Manifest,
+    pub outcome: RestoreOutcome,
+}
+
 /// Database restore (KB §5.4). Returns the source name when any object
 /// failed, so the run exits `1` while every other object still landed.
 async fn restore_database_source(
@@ -82,20 +89,50 @@ async fn restore_database_source(
     from: &str,
     dry_run: bool,
 ) -> Result<Vec<String>> {
+    match restore_database_to(config, store, source, target, from, dry_run).await? {
+        Some(done) => Ok(summarise(source, target, &done.outcome)),
+        None => Ok(vec![]),
+    }
+}
+
+/// The database restore flow up to and including the load; `None` on a dry
+/// run (after reporting). Shared with `verify`.
+pub(crate) async fn restore_database_to(
+    config: &Config,
+    store: &Store,
+    source: &Source,
+    target: &ResolvedTarget,
+    from: &str,
+    dry_run: bool,
+) -> Result<Option<DatabaseRestore>> {
     let selection = select_backup(config, source, from)?;
     let work = tempfile::tempdir()?;
     let extract = work.path().join("extract");
     let staged = stage_local(source, &selection, &extract).await?;
     guard_target(target, staged.as_ref()).await?;
     if dry_run {
-        return report_database_dry_run(store, source, target, &selection, staged.as_ref()).await;
+        report_database_dry_run(store, source, target, &selection, staged.as_ref()).await?;
+        return Ok(None);
     }
-    let manifest = match staged {
-        Some(manifest) => manifest,
-        None => fetch_and_unpack(store, source, &selection, work.path(), &extract).await?,
-    };
+    let manifest = materialise(store, source, &selection, staged, work.path(), &extract).await?;
     let outcome = restore_database(target, &extract, &manifest).await?;
-    Ok(summarise(source, target, &outcome))
+    Ok(Some(DatabaseRestore { manifest, outcome }))
+}
+
+/// The manifest to load from: the one already staged from a local archive,
+/// or the stored backup fetched and unpacked now.
+async fn materialise(
+    store: &Store,
+    source: &Source,
+    selection: &BackupSelection,
+    staged: Option<Manifest>,
+    work: &Path,
+    extract: &Path,
+) -> Result<Manifest> {
+    match staged {
+        Some(manifest) => Ok(manifest),
+        None => fetch_and_unpack(store, source, selection, work, extract).await,
+    }
 }
 
 /// Log the `{restored, skipped, failed}` summary; the source name comes back

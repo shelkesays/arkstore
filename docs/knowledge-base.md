@@ -833,3 +833,25 @@ MySQL 8.0+ / MariaDB 10.6+, MongoDB 5.0+ — widened only as the fidelity suite
 
 Runs on demand and in CI against containerized engines for every backend — the
 fidelity contract (§11.2) is gated by it. `--dry-run` reports without restoring.
+
+Rules the Postgres verifier applies (implementation notes):
+
+- **Target precedence:** an explicit `--target` / `ARKSTORE_TARGET` names a
+  `targets` entry that must be `ephemeral: true` (otherwise refused);
+  otherwise `verify.server`, when configured, creates a database; otherwise
+  the source-named entry is used, again only if ephemeral.
+- **Created database name:** `arkstore_verify_<source>_<stamp>` where
+  `<source>` is the source name lowercased, non-alphanumerics replaced by
+  `_`, cut to 24 characters, and `<stamp>` is the verify **run's** stamp in
+  `app.timezone` — unique per run and always under PostgreSQL's 63-byte limit.
+  `CREATE` / `DROP DATABASE … WITH (FORCE)` run on `verify.server`'s own
+  database (`db`, default `postgres`).
+- The restore is the normal restore path (§5), guards included; objects the
+  restore failed are reported by verify as `failed` with a `restore:` prefix.
+- The comparison runs inside a `REPEATABLE READ` snapshot on the target: the
+  same catalog reader and DDL emitter as the dump, definition first
+  (`schema_hash`), then for objects with a recorded `row_count` the row count
+  and `sum256` content hash from `COPY … TO STDOUT`. Objects present in the
+  target but absent from the manifest are reported as mismatched.
+- Ctrl-C is handled inside `verify` (not raced by the process-level handler)
+  so the throwaway database is still dropped; the exit code stays `130`.
